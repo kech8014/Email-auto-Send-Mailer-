@@ -2,5 +2,6 @@ node_modules
 .vercel
 
 # Real secrets never get committed; the annotated template does.
+# Order matters: the negation must come after the pattern it exempts.
 .env*
 !.env.example

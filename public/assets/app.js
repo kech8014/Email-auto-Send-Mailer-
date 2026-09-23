@@ -1038,7 +1038,12 @@
           el('div', { class: 'h-sm', text: draft.fileName }),
           el('p', { class: 'hint', text: fmtNum(draft.rows.length) + ' rows · ' + draft.columns.length + ' columns' })
         ]),
-        el('button', { class: 'btn btn--sm', text: 'Replace file', onclick: () => { draft.rows = []; draft.columns = []; draft.emailField = ''; renderRecipients(); renderMessage(); renderLaunch(); } })
+        el('button', { class: 'btn btn--sm', text: 'Replace file', onclick: () => {
+          // Clear the detected mapping too - it belongs to the file being replaced.
+          draft.rows = []; draft.columns = []; draft.emailField = '';
+          draft.subjectField = null; draft.bodyField = null; draft.composeManually = false;
+          renderRecipients(); renderMessage(); renderLaunch();
+        } })
       ]));
 
       recipientsSection.appendChild(el('div', { class: 'grid grid--4', style: { marginBottom: '18px' } }, [
@@ -1184,6 +1189,15 @@
 
     function renderMessage() {
       messageSection.innerHTML = '';
+
+      // Nothing to compose against until a list is imported, and the sheet may
+      // well supply the message itself - so this step stays out of the way
+      // rather than presenting empty fields that may never need filling.
+      if (!draft.rows.length) {
+        messageSection.hidden = true;
+        return;
+      }
+      messageSection.hidden = false;
 
       // When the sheet supplies both the subject and the body there is nothing
       // to write, so the editor would be a step that asks for work already done.
