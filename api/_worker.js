@@ -114,7 +114,7 @@ async function hasOutstanding(meta) {
 function buildMessage(meta, conn, row) {
   const fields = Object.assign({}, row.fields, { email: row.email });
   const subject = engine.render(meta.subject, fields);
-  const rendered = engine.render(meta.body, fields);
+  const rendered = engine.render(meta.body, fields, null, { html: Boolean(meta.isHtml) });
 
   const html = meta.isHtml ? rendered : null;
   const text = meta.isHtml ? engine.textFromHtml(rendered) : rendered;

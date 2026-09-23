@@ -270,14 +270,27 @@ function buildLookup(fields) {
   return lookup;
 }
 
-function render(template, fields, fallbacks) {
+/**
+ * Substitute {{column}} tokens.
+ *
+ * `html: true` escapes each substituted value and turns its line breaks into
+ * <br>. That matters whenever a whole message body arrives from a spreadsheet
+ * column: the text carries real paragraph breaks that would otherwise collapse
+ * into one run-on block, and an unescaped & or < in a firm name would corrupt
+ * the surrounding markup. Escaping applies only to the substituted values -
+ * markup written deliberately in the template is left alone.
+ */
+function render(template, fields, fallbacks, options) {
   if (!template) return '';
+  const html = Boolean(options && options.html);
   const lookup = buildLookup(fields);
+  const emit = (value) => (html ? escapeHtml(value).replace(/\r\n|\r|\n/g, '<br>') : value);
+
   return String(template).replace(/\{\{\s*([^}|]+?)\s*(?:\|\s*([^}]*?)\s*)?\}\}/g, (match, token, fallback) => {
     const value = lookup.get(normalizeKey(token));
-    if (value != null && String(value).trim() !== '') return String(value).trim();
-    if (fallback != null) return fallback;
-    if (fallbacks && fallbacks[normalizeKey(token)] != null) return fallbacks[normalizeKey(token)];
+    if (value != null && String(value).trim() !== '') return emit(String(value).trim());
+    if (fallback != null) return emit(fallback);
+    if (fallbacks && fallbacks[normalizeKey(token)] != null) return emit(String(fallbacks[normalizeKey(token)]));
     return '';
   });
 }

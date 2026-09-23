@@ -185,6 +185,9 @@
       rows: [],
       columns: [],
       emailField: '',
+      subjectField: null,      // set when the sheet carries a subject column
+      bodyField: null,         // set when the sheet carries the message body
+      composeManually: false,  // user chose to override the mapping
       subject: '',
       body: '',
       isHtml: true,
@@ -295,6 +298,66 @@
     { role: 'website', hints: ['website', 'url', 'site', 'web'] }
   ];
 
+  /**
+   * A spreadsheet often carries the whole message: a subject column and a
+   * ready-written body per recipient. When it does, there is nothing for the
+   * user to compose, so finding these columns is what removes the manual step.
+   *
+   * Header names vary between exports, so match on a normalised key first, then
+   * fall back to the shape of the data - a body column is long and prose-like,
+   * a subject column is short and single-line.
+   */
+  const SUBJECT_HINTS = [
+    'subject', 'subjectline', 'emailsubject', 'mailsubject', 'subjecttext',
+    'headline', 'subj', 'titleline'
+  ];
+  const BODY_HINTS = [
+    'customizedemail', 'customisedemail', 'customemail', 'personalizedemail',
+    'personalisedemail', 'emailcontent', 'emailbody', 'messagebody', 'mailbody',
+    'body', 'message', 'content', 'emailtext', 'letter', 'draft', 'pitch',
+    'emailmessage', 'text'
+  ];
+
+  function columnStats(rows, col) {
+    const sample = rows.slice(0, 40).map((r) => String(r[col] == null ? '' : r[col]));
+    const filled = sample.filter((v) => v.trim() !== '');
+    if (!filled.length) return { avgLen: 0, multiline: 0, filled: 0 };
+    return {
+      avgLen: filled.reduce((a, v) => a + v.length, 0) / filled.length,
+      multiline: filled.filter((v) => /\r|\n/.test(v)).length / filled.length,
+      filled: filled.length / sample.length
+    };
+  }
+
+  function detectSubjectColumn(columns, rows, exclude) {
+    const pool = columns.filter((c) => !exclude.includes(c));
+    const named = pool.find((c) => SUBJECT_HINTS.includes(normKey(c)));
+    if (named) return named;
+    // A subject is short, single-line and present on most rows.
+    let best = null, bestLen = Infinity;
+    for (const col of pool) {
+      const s = columnStats(rows, col);
+      if (s.filled < 0.8 || s.multiline > 0.05) continue;
+      if (s.avgLen >= 12 && s.avgLen <= 120 && s.avgLen < bestLen) { bestLen = s.avgLen; best = col; }
+    }
+    return best;
+  }
+
+  function detectBodyColumn(columns, rows, exclude) {
+    const pool = columns.filter((c) => !exclude.includes(c));
+    const named = pool.find((c) => BODY_HINTS.includes(normKey(c)));
+    if (named) return named;
+    // A body is the long, prose-like column - usually multi-line.
+    let best = null, bestLen = 0;
+    for (const col of pool) {
+      const s = columnStats(rows, col);
+      if (s.filled < 0.6) continue;
+      const looksLikeBody = s.avgLen > 160 || (s.multiline > 0.4 && s.avgLen > 80);
+      if (looksLikeBody && s.avgLen > bestLen) { bestLen = s.avgLen; best = col; }
+    }
+    return best;
+  }
+
   /** Map spreadsheet columns onto the personalisation roles we recognise. */
   function detectRoles(columns) {
     const out = [];
@@ -303,6 +366,53 @@
       if (match) out.push({ role, column: match });
     }
     return out;
+  }
+
+  /**
+   * Workbooks are rarely one sheet of clean data. Templates ship an
+   * "Instructions" or "Readme" tab, and it is not always first - taking sheet
+   * zero on faith imports the documentation as recipients.
+   *
+   * So score every sheet on the only thing that actually matters: how many
+   * cells look like email addresses. Ties break toward the earlier sheet.
+   */
+  function pickRecipientSheet(workbook) {
+    let best = null;
+
+    for (const name of workbook.SheetNames) {
+      const sheet = workbook.Sheets[name];
+      if (!sheet) continue;
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: '' });
+      if (matrix.length < 2) continue;
+
+      let emails = 0;
+      let cells = 0;
+      for (const row of matrix.slice(1, 60)) {
+        for (const cell of row) {
+          const v = String(cell == null ? '' : cell).trim();
+          if (!v) continue;
+          cells += 1;
+          if (EMAIL_SHAPE.test(v)) emails += 1;
+        }
+      }
+      const score = cells ? emails / cells : 0;
+      if (!best || emails > best.emails || (emails === best.emails && score > best.score)) {
+        best = { name, matrix, emails, score };
+      }
+    }
+
+    if (!best) throw new Error('The workbook has no sheets with data');
+
+    // Nothing resembled an address anywhere - fall back to the first sheet with
+    // rows and let column detection and validation report the problem.
+    if (!best.emails) {
+      const first = workbook.SheetNames
+        .map((n) => XLSX.utils.sheet_to_json(workbook.Sheets[n], { header: 1, blankrows: false, defval: '' }))
+        .find((m) => m.length >= 2);
+      return first || best.matrix;
+    }
+
+    return best.matrix;
   }
 
   function readSpreadsheet(file) {
@@ -321,9 +431,8 @@
           } else {
             if (typeof XLSX === 'undefined') throw new Error('Spreadsheet reader failed to load. Check your network and reload.');
             const workbook = XLSX.read(new Uint8Array(reader.result), { type: 'array', cellDates: false, raw: false });
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            if (!sheet) throw new Error('The workbook has no sheets');
-            matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: '' });
+            if (!workbook.SheetNames.length) throw new Error('The workbook has no sheets');
+            matrix = pickRecipientSheet(workbook);
           }
           const parsed = matrixToObjects(matrix);
           if (!parsed.rows.length) throw new Error('No data rows were found in the file');
@@ -981,7 +1090,19 @@
         draft.fileName = file.name;
         draft.emailField = detectEmailColumn(parsed.columns, parsed.rows) || parsed.columns[0];
         if (!draft.name) draft.name = file.name.replace(/\.[^.]+$/, '') + ' outreach';
-        toast(fmtNum(parsed.rows.length) + ' rows imported from ' + file.name, 'ok');
+
+        // If the sheet already carries the message, wire it up: the subject and
+        // body become per-row tokens and there is nothing left to compose.
+        const exclude = [draft.emailField];
+        draft.subjectField = detectSubjectColumn(parsed.columns, parsed.rows, exclude);
+        draft.bodyField = detectBodyColumn(parsed.columns, parsed.rows, exclude.concat(draft.subjectField || []));
+
+        if (draft.subjectField) draft.subject = '{{' + draft.subjectField + '}}';
+        if (draft.bodyField) { draft.body = '{{' + draft.bodyField + '}}'; draft.isHtml = true; }
+
+        const mapped = [draft.subjectField && 'subject', draft.bodyField && 'message'].filter(Boolean);
+        toast(fmtNum(parsed.rows.length) + ' rows imported from ' + file.name +
+          (mapped.length ? ' · ' + mapped.join(' and ') + ' taken from the sheet' : ''), 'ok');
         renderRecipients();
         renderMessage();
         renderLaunch();
@@ -991,8 +1112,86 @@
     }
 
     // ---- 2. message ----
+
+    /**
+     * The spreadsheet carried the whole message. Confirm the mapping and show
+     * what row 1 will actually receive - no fields to fill in.
+     */
+    function renderMappedMessage() {
+      messageSection.appendChild(sectionHead('02', 'Message', 'Taken from your spreadsheet — each recipient gets their own subject and body. Nothing to write.'));
+
+      messageSection.appendChild(el('div', { class: 'field', style: { marginBottom: '16px' } }, [
+        el('label', { class: 'label', text: 'Campaign name' }),
+        el('input', { class: 'input', value: draft.name, placeholder: 'Q1 attorney outreach', oninput: (e) => { draft.name = e.target.value; } })
+      ]));
+
+      const mapRow = (label, column) => el('div', { class: 'between', style: { padding: '9px 0' } }, [
+        el('span', { class: 'hint', text: label }),
+        el('span', { class: 'row', style: { gap: '8px' } }, [
+          el('span', { class: 'chip', text: column }),
+          el('span', { class: 'pill pill--ok' }, [el('span', { class: 'dot' }), el('span', { text: 'per recipient' })])
+        ])
+      ]);
+
+      messageSection.appendChild(el('div', { class: 'card card--flat', style: { marginBottom: '18px' } }, [
+        el('span', { class: 'label', text: 'Column mapping' }),
+        el('div', { style: { marginTop: '6px' } }, [
+          mapRow('Recipient', draft.emailField),
+          mapRow('Subject', draft.subjectField),
+          mapRow('Body', draft.bodyField)
+        ])
+      ]));
+
+      // Row stepper, so more than the first recipient can be spot-checked.
+      let previewRow = 0;
+      const previewBox = el('div');
+
+      const paint = () => {
+        const sample = draft.rows[previewRow] || {};
+        const subject = renderTemplate(draft.subject, sample, false);
+        const rendered = renderTemplate(draft.body, sample, draft.isHtml);
+        previewBox.innerHTML = '';
+        previewBox.appendChild(el('div', { class: 'preview-head' }, [
+          el('div', { class: 'between' }, [
+            el('div', { style: { minWidth: 0 } }, [
+              el('div', { class: 'truncate', style: { fontSize: '13.5px' }, text: subject || '(no subject)' }),
+              el('p', { class: 'hint truncate', text: 'From ' + (state.connection.fromName ? state.connection.fromName + ' <' + state.connection.email + '>' : state.connection.email) + '  ·  To ' + (sample[draft.emailField] || 'recipient@example.com') })
+            ]),
+            el('div', { class: 'row', style: { gap: '6px', flex: 'none' } }, [
+              el('button', { class: 'btn btn--sm', text: '‹', title: 'Previous recipient', disabled: previewRow === 0, onclick: () => { previewRow -= 1; paint(); } }),
+              el('span', { class: 'hint', style: { minWidth: '74px', textAlign: 'center' }, text: 'Row ' + (previewRow + 1) + ' / ' + fmtNum(draft.rows.length) }),
+              el('button', { class: 'btn btn--sm', text: '›', title: 'Next recipient', disabled: previewRow >= draft.rows.length - 1, onclick: () => { previewRow += 1; paint(); } })
+            ])
+          ])
+        ]));
+        const frame = el('div', { class: 'preview-frame' });
+        if (draft.isHtml) frame.innerHTML = sanitize(rendered || '<p style="color:#999">This row has an empty body.</p>');
+        else frame.appendChild(el('pre', { style: { whiteSpace: 'pre-wrap', margin: '0', fontFamily: 'inherit' }, text: rendered || 'This row has an empty body.' }));
+        previewBox.appendChild(frame);
+      };
+
+      messageSection.appendChild(el('div', { class: 'between', style: { marginBottom: '10px' } }, [
+        el('span', { class: 'label', text: 'Live preview' }),
+        el('button', {
+          class: 'btn btn--sm',
+          text: 'Write the message myself instead',
+          onclick: () => { draft.composeManually = true; renderMessage(); renderLaunch(); }
+        })
+      ]));
+      messageSection.appendChild(previewBox);
+      paint();
+    }
+
     function renderMessage() {
       messageSection.innerHTML = '';
+
+      // When the sheet supplies both the subject and the body there is nothing
+      // to write, so the editor would be a step that asks for work already done.
+      // Show what was mapped instead, with a way back to writing by hand.
+      if (draft.subjectField && draft.bodyField && !draft.composeManually) {
+        return renderMappedMessage();
+      }
+
       messageSection.appendChild(sectionHead('02', 'Message', 'Insert {{variables}} from any spreadsheet column. Add a fallback with {{column|default}}.'));
 
       const nameInput = el('input', { class: 'input', value: draft.name, placeholder: 'Q1 attorney outreach', oninput: (e) => { draft.name = e.target.value; } });
@@ -1077,7 +1276,7 @@
 
       function renderPreview() {
         const sample = draft.rows[0] || {};
-        const rendered = renderTemplate(draft.body, sample);
+        const rendered = renderTemplate(draft.body, sample, draft.isHtml);
         const subject = renderTemplate(draft.subject, sample);
         previewBox.innerHTML = '';
         previewBox.appendChild(el('div', { class: 'preview-head' }, [
@@ -1434,14 +1633,22 @@
   }
 
   /** Mirror of the server-side renderer so the preview is faithful. */
-  function renderTemplate(template, fields) {
+  const escapeHtml = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  /**
+   * Mirrors render() in api/_engine.js, including the html mode that escapes
+   * substituted values and converts their line breaks. The preview is only
+   * worth showing if it matches what the worker will actually send.
+   */
+  function renderTemplate(template, fields, asHtml) {
     if (!template) return '';
     const lookup = new Map();
     for (const [k, v] of Object.entries(fields || {})) lookup.set(normKey(k), v);
+    const emit = (v) => (asHtml ? escapeHtml(v).replace(/\r\n|\r|\n/g, '<br>') : v);
     return String(template).replace(/\{\{\s*([^}|]+?)\s*(?:\|\s*([^}]*?)\s*)?\}\}/g, (match, token, fallback) => {
       const value = lookup.get(normKey(token));
-      if (value != null && String(value).trim() !== '') return String(value).trim();
-      return fallback != null ? fallback : '';
+      if (value != null && String(value).trim() !== '') return emit(String(value).trim());
+      return fallback != null ? emit(fallback) : '';
     });
   }
 
@@ -2121,6 +2328,17 @@
     }
 
     startHeartbeat();
+
+    // A campaign runs on the server, not in this tab. Whoever opens the console
+    // next - after a reload, on a phone, on a colleague's machine - should land
+    // on it rather than have to go looking.
+    const live = state.campaigns.find((c) => c.status === 'running' || c.status === 'paused' || c.status === 'blocked');
+    if (live && !location.hash) {
+      state.activeCampaignId = live.id;
+      toast((live.status === 'running' ? 'Campaign in progress' : 'Campaign ' + live.status) + ' — ' + live.name, 'ok', 5000);
+      return go('monitor');
+    }
+
     go((location.hash || '#dashboard').slice(1));
   }
 
