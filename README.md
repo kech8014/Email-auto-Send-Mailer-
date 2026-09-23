@@ -18,8 +18,9 @@ There is no open tracking, no click tracking, no invented delivery metrics.
 | Recipients | CSV/XLSX import, delimiter and header detection, Unicode, quoted fields, email-column detection, personalization-role detection, normalization, de-duplication, malformed-address flagging, preview table |
 | Composer | Subject and body with `{{merge_field}}` tokens from any detected column, rich text and raw HTML modes, live rendered preview, multi-attachment drag-and-drop with size validation |
 | Preflight | Blocks the start on missing/invalid addresses, missing merge values, oversized attachments, a disconnected mailbox, duplicates, or cap conflicts — with a confirmation panel before the first send |
-| Sending | Randomized delay window (default 5s–2m), hourly and daily caps, exponential backoff on transient errors, permanent-failure classification, pause / resume / stop, retry-failed |
+| Sending | **Every message waits a fresh random gap drawn uniformly from 5s–2m** (`DEFAULT_PACING` in `api/_engine.js`), hourly (60) and daily (400) caps, exponential backoff on transient errors, permanent-failure classification, pause / resume / stop, retry-failed |
 | Monitoring | SSE live feed with per-recipient state, progress, current rate, ETA, elapsed time, next-send countdown, timestamped activity log |
+| Sample campaign | A dashboard rehearsal of the live monitor on invented recipients — an automation rail, progress ring, per-recipient table and activity feed, drawing its gaps from the same 5s–2m window. Nothing is sent; a fast-forward control compresses the wait without distorting the reported rate or ETA |
 | History | Every campaign with counts, duration, status and attachments; open one to inspect every recipient and event |
 | Compliance | `List-Unsubscribe` header on every message, suppression list, plain-text alternative generated from the HTML |
 
@@ -66,7 +67,7 @@ scripts/
 request cannot. Each `/api/tick` invocation takes the lock, sends exactly one
 message, persists the result, and schedules the next tick. Nothing depends on
 the browser staying open. If a chain dies — a cold start, a deploy, a network
-blip — the hourly cron sweep and the dashboard heartbeat both revive it, and the
+blip — the cron sweep and the dashboard heartbeat both revive it, and the
 per-recipient state in the store means a revived chain resumes rather than
 restarts. That is what makes duplicate sends structurally impossible rather than
 merely unlikely.
@@ -125,15 +126,21 @@ boundary (sealed passwords, tampered sessions, campaign-scoped worker tokens).
    | `SECRET_KEY` | yes | seals credentials, signs sessions and worker tokens |
    | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | one store | persistence |
    | `BLOB_READ_WRITE_TOKEN` | one store | persistence (alternative) |
-   | `CRON_SECRET` | recommended | authorises the hourly sweep |
+   | `CRON_SECRET` | recommended | authorises the cron sweep |
    | `PUBLIC_BASE_URL` | if custom domain | origin the worker chains to |
 
 4. **Deploy.** `vercel.json` already sets the function durations (60s for the
    tick, stream, connection test and campaign endpoints) and registers the
-   hourly cron `GET /api/tick?sweep=1`.
+   cron sweep `GET /api/tick?sweep=1`.
 
 5. **Verify** `GET /api/health` returns `"status": "ok"` with no warnings, then
    sign in and connect a mailbox.
+
+> **Hobby plan:** Vercel limits Hobby accounts to one cron run per day, so the
+> sweep is scheduled at `0 3 * * *`. The sweep is only the backstop — the worker
+> chains itself from tick to tick, and the open dashboard sends a revive
+> heartbeat every two minutes. On Pro, tighten it to `0 * * * *` for a campaign
+> that can recover within the hour even with nobody watching.
 
 > Rotating `SECRET_KEY` invalidates every stored credential and every session.
 > Re-enter the mailbox password afterwards.
@@ -170,6 +177,29 @@ No response body ever contains an SMTP or IMAP password, a token, or the secret
 key — `_view.js` projects every stored object before it leaves the server.
 
 ---
+
+## Pacing
+
+Pacing is the part most likely to get a domain in trouble, so it is worth being
+precise about what the code does.
+
+`nextDelay()` draws a fresh uniform random value in `[minDelayMs, maxDelayMs]`
+before **every** message — default `5000`–`120000`, i.e. 5 seconds to 2 minutes.
+It is not an average and not a fixed cadence: consecutive gaps differ, which is
+the point. On top of that sit rolling hourly (60) and daily (400) caps; when one
+binds, the campaign reports `blocked` with the time it will resume rather than
+pushing through.
+
+The window is visible in three places: the **Sending gap** row on the dashboard
+identity card, the countdown on the live monitor, and the sample campaign, which
+names the gap it actually drew (“waiting 1m 10s, drawn at random from 5s–2m”).
+All three read the same settings, so changing the policy in Settings changes
+every readout.
+
+This is self-restraint, not evasion. It exists to stay comfortably inside what a
+provider already permits — when the provider itself returns a limit or an error,
+the worker backs off and surfaces the reason verbatim rather than working around
+it.
 
 ## Security notes
 
