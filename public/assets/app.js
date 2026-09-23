@@ -1398,7 +1398,7 @@
     // ---- 3. attachments ----
     function renderAttachments() {
       attachSection.innerHTML = '';
-      attachSection.appendChild(sectionHead('03', 'Attachments', 'Every file here is attached to every recipient.'));
+      attachSection.appendChild(sectionHead('03', 'Attachments', 'Any file — PDF, document, image, or the email content itself. Every file here is attached to every recipient.'));
 
       const list = el('div', { class: 'stack', style: { marginBottom: draft.attachments.length ? '14px' : '0' } },
         draft.attachments.map((a, i) => el('div', { class: 'file-row' }, [
@@ -1420,7 +1420,7 @@
       attachSection.appendChild(list);
 
       const zone = el('div', { class: 'dropzone', style: { padding: '24px' } }, [
-        el('div', { class: 'big', text: draft.attachments.length ? 'Add another file' : 'Drop the brochure or report here' }),
+        el('div', { class: 'big', text: draft.attachments.length ? 'Add another file' : 'Drop any attachment here' }),
         el('p', { class: 'hint', text: 'PDF, Word, Excel, PowerPoint, images, CSV or ZIP' })
       ]);
       const input = el('input', { type: 'file', multiple: true, hidden: true, onchange: (e) => uploadFiles(Array.from(e.target.files)) });

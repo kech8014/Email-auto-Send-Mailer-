@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const store = require('./_store');
 const engine = require('./_engine');
 const providers = require('./_providers');
+const sent = require('./_sent');
 const secrets = require('./_crypto');
 
 /**
@@ -185,10 +186,14 @@ async function runTick(campaignId) {
     maxMessages: 50
   });
 
+  // Same mailbox login as SMTP; opened lazily on the first successful send.
+  const sentSaver = sent.createSentSaver(conn, credentials, (msg) => console.warn('[worker] ' + msg));
+
   const startedAt = Date.now();
   const deadline = startedAt + engine.TICK_BUDGET_MS;
   let sentThisTick = 0;
   let stopReason = 'budget';
+  let warnedAboutSent = false;
 
   try {
     while (Date.now() < deadline) {
@@ -238,9 +243,25 @@ async function runTick(campaignId) {
       const attemptNumber = (row.attempts || 0) + 1;
 
       let outcome;
+      let rawMessage = null;
       try {
-        const info = await transport.sendMail(message);
-        outcome = { ok: true, messageId: info.messageId, response: info.response };
+        // Compile once and send those exact bytes, so the copy filed in Sent is
+        // the message that was delivered - same Message-ID, same attachments -
+        // rather than a re-render that might differ.
+        const MailComposer = require('nodemailer/lib/mail-composer');
+        rawMessage = await new MailComposer(message).compile().build();
+        const info = await transport.sendMail({
+          envelope: { from: conn.email, to: [row.email] },
+          raw: rawMessage
+        });
+        // sendMail resolves even when the server accepted the envelope but
+        // rejected this recipient, so trust the recipient list, not the promise.
+        const rejected = (info.rejected || []).length;
+        if (rejected) {
+          outcome = { ok: false, permanent: true, reason: 'Server rejected the recipient: ' + (info.response || 'no response') };
+        } else {
+          outcome = { ok: true, messageId: info.messageId, response: info.response };
+        }
       } catch (err) {
         outcome = { ok: false, ...providers.classifyFailure(err) };
       }
@@ -266,6 +287,16 @@ async function runTick(campaignId) {
         meta.sendLog = [...(meta.sendLog || []), nowAfter].filter((t) => nowAfter - t < 86400000);
         engine.pushEvent(meta, 'sent', 'Email sent to ' + row.email, 'attempt ' + attemptNumber);
         sentThisTick += 1;
+
+        // File a copy in the mailbox's Sent folder. The message is already
+        // delivered, so this can never turn a success into a failure.
+        if (sentSaver && sentSaver.enabled && rawMessage && meta.saveToSent !== false) {
+          const problem = await sentSaver.save(rawMessage);
+          if (problem && !warnedAboutSent) {
+            warnedAboutSent = true;
+            engine.pushEvent(meta, 'warning', 'Sent mail is not being copied to your Sent folder', problem);
+          }
+        }
       } else if (outcome.kind === 'auth') {
         // Credentials stopped working mid-campaign: stop rather than hammer.
         meta.status = 'blocked';
@@ -337,6 +368,7 @@ async function runTick(campaignId) {
     }
   } finally {
     try { transport.close(); } catch (_) {}
+    try { await sentSaver.close(); } catch (_) {}
     await store.releaseLock(campaignId, lockToken);
   }
 

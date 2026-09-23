@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "description": "Encrypted, resumable email campaign automation console",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@vercel/blob": "^0.27.3",
+    "imapflow": "^2.0.6",
     "nodemailer": "^6.9.16"
   }
 }
