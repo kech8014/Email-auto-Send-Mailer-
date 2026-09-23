@@ -49,7 +49,11 @@ function liveMetrics(meta) {
     settled,
     remaining: meta.stats.total - settled,
     elapsedMs,
-    ratePerHour: recent.length,
+    // Derived from the observed gap, not the count of sends so far: a campaign
+    // two minutes old has sent a handful of messages, and reporting that count
+    // as a per-hour rate understates it by an order of magnitude. Pauses from a
+    // cap or a backoff are already reflected in the measured interval.
+    ratePerHour: avgIntervalMs ? Math.round(3600000 / avgIntervalMs) : 0,
     avgIntervalMs,
     etaMs: meta.status === 'running' ? engine.estimateDuration(meta).ms : null,
     nextSendAt: meta.nextSendAt,
