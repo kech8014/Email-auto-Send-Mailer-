@@ -259,11 +259,20 @@ module.exports = http.protect(async (req, res) => {
     case 'delete': {
       const meta = await engine.getMeta(body.id);
       if (meta) {
+        // Halt first. A tick may be asleep in its pacing gap right now; the
+        // loop re-reads status before every send, so marking it stopped closes
+        // the window where it wakes and sends one more after the delete.
+        if (meta.status === 'running') {
+          meta.status = 'stopped';
+          meta.nextSendAt = null;
+          engine.pushEvent(meta, 'campaign', 'Campaign stopped - deleted by operator');
+          await engine.setMeta(meta);
+        }
         for (let c = 0; c < Math.max(1, meta.chunkCount); c += 1) await store.del('campaigns/' + body.id + '/r/' + c);
         await store.del('campaigns/' + body.id);
         await store.unindexCampaign(body.id);
       }
-      result = { status: 200, payload: { ok: true } };
+      result = { status: 200, payload: { ok: true, deleted: Boolean(meta), wasRunning: Boolean(meta && meta.status === 'stopped') } };
       break;
     }
 

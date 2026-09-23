@@ -166,6 +166,43 @@
     });
   }
 
+  /**
+   * Two-step delete for something irreversible.
+   *
+   * The first step states the consequences. The second asks the operator to
+   * type the word, because a second identical "are you sure?" is dismissed by
+   * reflex and a campaign's send history cannot be recovered once it is gone.
+   */
+  function confirmDestructive(title, message, typeWord, confirmLabel) {
+    return new Promise((resolve) => {
+      const first = modal(title, el('div', {}, [
+        el('p', { class: 'lede', text: message }),
+        el('p', { class: 'hint', style: { marginTop: '12px' }, text: 'This cannot be undone.' })
+      ]), [
+        el('button', { class: 'btn', text: 'Cancel', onclick: () => { first(); resolve(false); } }),
+        el('button', { class: 'btn btn--danger', text: confirmLabel || 'Continue', onclick: () => { first(); step2(); } })
+      ]);
+
+      function step2() {
+        const input = el('input', { class: 'input', placeholder: typeWord, autocomplete: 'off' });
+        const err = el('p', { class: 'hint hint--err', hidden: true, text: 'That does not match.' });
+        const go = el('button', { class: 'btn btn--danger', text: 'Delete permanently', onclick: () => {
+          if (input.value.trim().toUpperCase() !== typeWord.toUpperCase()) { err.hidden = false; input.focus(); return; }
+          second(); resolve(true);
+        } });
+        const second = modal('Confirm deletion', el('div', {}, [
+          el('p', { class: 'lede', text: 'Type ' + typeWord + ' to confirm.' }),
+          el('div', { class: 'field', style: { marginTop: '14px' } }, [input, err])
+        ]), [
+          el('button', { class: 'btn', text: 'Cancel', onclick: () => { second(); resolve(false); } }),
+          go
+        ]);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go.click(); });
+        setTimeout(() => input.focus(), 30);
+      }
+    });
+  }
+
   // ------------------------------------------------------------------ state --
 
   const state = {
@@ -660,12 +697,57 @@
                 ])
               ]),
               el('td', { class: 'hint', text: fmtDate(c.createdAt) }),
-              el('td', {}, [el('button', { class: 'btn btn--sm', text: 'Open', onclick: () => openCampaign(c.id) })])
+              el('td', {}, [el('div', { class: 'row', style: { gap: '6px', justifyContent: 'flex-end' } }, [
+                el('button', { class: 'btn btn--sm', text: 'Open', onclick: () => openCampaign(c.id) }),
+                el('button', { class: 'btn btn--sm btn--danger', text: 'Delete', title: 'Delete this campaign and its history', onclick: () => deleteCampaign(c) })
+              ])])
             ]);
           }))
         ])
       ])
     ]);
+  }
+
+  /**
+   * Delete a campaign everywhere at once.
+   *
+   * The server drops the metadata, every recipient chunk and the index entry,
+   * so it cannot come back in a list. The client then has to forget it too:
+   * a stale activeCampaignId would send the monitor looking for a campaign that
+   * no longer exists, and cached summaries would keep it on the dashboard until
+   * the next reload.
+   */
+  async function deleteCampaign(c) {
+    const running = c.status === 'running';
+    const ok = await confirmDestructive(
+      'Delete "' + (c.name || 'campaign') + '"?',
+      (running
+        ? 'This campaign is still sending. It will be stopped immediately, then deleted. '
+        : '') +
+      'Its recipient list, per-recipient results and activity history will be removed from the dashboard, campaign history and analytics. ' +
+      fmtNum(c.stats ? c.stats.sent : 0) + ' message(s) have already been delivered and cannot be recalled.',
+      'DELETE'
+    );
+    if (!ok) return;
+
+    try {
+      await api('campaign', { action: 'delete', id: c.id });
+    } catch (err) {
+      return toast(err.message, 'err');
+    }
+
+    // Forget it locally so nothing keeps pointing at a deleted record.
+    if (state.activeCampaignId === c.id) {
+      state.activeCampaignId = null;
+      state.campaign = null;
+      state.metrics = null;
+      unsubscribe();
+    }
+    state.campaigns = state.campaigns.filter((x) => x.id !== c.id);
+    state.analytics = null;          // totals and the 14-day series both included it
+
+    toast('Campaign deleted', 'ok');
+    render();
   }
 
   // ==========================================================================
@@ -1828,6 +1910,17 @@
       renderMonitor(shell);
       subscribe(state.activeCampaignId, shell);
     } catch (err) {
+      // It may have been deleted from another device since we last looked.
+      // Forget it and fall back rather than pinning the view to a dead id.
+      if (/not found/i.test(err.message)) {
+        state.activeCampaignId = null;
+        state.campaign = null;
+        state.campaigns = state.campaigns.filter((c) => c.id !== state.activeCampaignId);
+        shell.innerHTML = '';
+        shell.appendChild(emptyState('That campaign no longer exists', 'It was deleted. Pick another from Campaigns.',
+          el('button', { class: 'btn btn--primary', text: 'View campaigns', onclick: () => go('campaigns') })));
+        return;
+      }
       shell.innerHTML = '';
       shell.appendChild(emptyState('Could not load that campaign', err.message));
     }
