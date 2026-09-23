@@ -416,10 +416,26 @@
     ],
     // Fixed outcomes, so the rehearsal always shows a retry and a bounce.
     scripted: { 4: 'retry', 9: 'bounce', 14: 'retry' },
-    // The real pacing window, matching DEFAULT_PACING in api/_engine.js.
-    minGap: 5000,
-    maxGap: 120000
+    // Mirrors GAP_BUCKETS in api/_engine.js - keep the two in step, or the
+    // rehearsal stops predicting what production will actually do.
+    buckets: [
+      { from: 5000, to: 10000, weight: 55 },
+      { from: 10000, to: 30000, weight: 25 },
+      { from: 30000, to: 80000, weight: 15 },
+      { from: 80000, to: 120000, weight: 5 }
+    ]
   };
+
+  function demoDrawGap() {
+    const total = DEMO.buckets.reduce((sum, b) => sum + b.weight, 0);
+    let roll = Math.random() * total;
+    let bucket = DEMO.buckets[DEMO.buckets.length - 1];
+    for (const b of DEMO.buckets) {
+      if (roll < b.weight) { bucket = b; break; }
+      roll -= b.weight;
+    }
+    return Math.round(bucket.from + Math.random() * (bucket.to - bucket.from));
+  }
 
   const demo = {
     timer: null,
@@ -502,7 +518,7 @@
    */
   function demoSchedule() {
     clearTimeout(demo.timer);
-    const gap = DEMO.minGap + Math.random() * (DEMO.maxGap - DEMO.minGap);
+    const gap = demoDrawGap();
     demo.pendingGap = gap;
     demo.nextAt = Date.now() + gap / demo.speed;
     demo.timer = setTimeout(demoSend, gap / demo.speed);
@@ -575,56 +591,6 @@
     };
   }
 
-  /**
-   * A plain-language picture of the pipeline, for anyone who should not have to
-   * read a table to know whether the thing is working. Four stops, a live wire,
-   * and an envelope that visibly travels it. It is driven by the same state as
-   * everything else on the panel - it never animates when nothing is happening.
-   */
-  function railIcon(kind) {
-    const svg = (inner, cls) => {
-      const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      s.setAttribute('viewBox', '0 0 24 24');
-      s.setAttribute('width', '21');
-      s.setAttribute('height', '21');
-      s.setAttribute('fill', 'none');
-      s.setAttribute('stroke', 'currentColor');
-      s.setAttribute('stroke-width', '1.3');
-      s.setAttribute('stroke-linecap', 'round');
-      s.setAttribute('stroke-linejoin', 'round');
-      s.innerHTML = inner;
-      if (cls) s.setAttribute('class', cls);
-      return s;
-    };
-    if (kind === 'list') return svg('<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>');
-    if (kind === 'engine') return svg('<g class="gear"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v2.6M12 18.8v2.6M21.4 12h-2.6M5.2 12H2.6M18.6 5.4l-1.9 1.9M7.3 16.7l-1.9 1.9M18.6 18.6l-1.9-1.9M7.3 7.3L5.4 5.4"/></g>');
-    if (kind === 'mailbox') return svg('<rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M2.5 8.2l9.5 6 9.5-6"/>');
-    return svg('<circle cx="12" cy="8.5" r="3.4"/><path d="M4.5 20a7.5 7.5 0 0115 0"/>');
-  }
-
-  function railNode(kind, cap, sub, extraClass) {
-    return el('div', { class: 'rail-node ' + (extraClass || ''), 'data-on': '0' }, [
-      el('div', { class: 'disc' }, [railIcon(kind)]),
-      el('span', { class: 'cap', text: cap }),
-      el('span', { class: 'sub', text: sub })
-    ]);
-  }
-
-  function demoRail() {
-    const nodes = {
-      list: railNode('list', 'List', '18 recipients'),
-      engine: railNode('engine', 'Kech', 'waiting out the gap', 'rail-node--engine'),
-      mailbox: railNode('mailbox', 'Your mailbox', 'sends one at a time'),
-      out: railNode('person', 'Recipient', 'personalised', 'rail-node--out')
-    };
-    const rail = el('div', { class: 'rail' }, [
-      el('div', { class: 'wire' }),
-      el('span', { class: 'pkt' }), el('span', { class: 'pkt' }), el('span', { class: 'pkt' }),
-      nodes.list, nodes.engine, nodes.mailbox, nodes.out
-    ]);
-    return { rail, nodes };
-  }
-
   /** Builds the panel once; demoPaint() mutates it in place so nothing flickers. */
   function demoPanel() {
     const ring = el('div', { class: 'ring' }, [
@@ -670,23 +636,17 @@
     ]);
     speed.value = String(demo.speed);
 
-    const railParts = demoRail();
-
-    demo.nodes = { ring, meter, legendRow, countdown, countdownFoot, statsRow, current, tbody, feed, livePill, btnToggle,
-                   rail: railParts.rail, railNodes: railParts.nodes };
+    demo.nodes = { ring, meter, legendRow, countdown, countdownFoot, statsRow, current, tbody, feed, livePill, btnToggle };
 
     return el('div', { class: 'card card--glass card--pad-lg', style: { marginTop: '14px' } }, [
       el('div', { class: 'between', style: { marginBottom: '20px', flexWrap: 'wrap', gap: '14px' } }, [
         el('div', { style: { minWidth: 0 } }, [
           el('p', { class: 'eyebrow', text: 'Preview' }),
           el('h2', { class: 'h-md', style: { margin: '8px 0 6px' }, text: 'Sample campaign in progress' }),
-          el('p', { class: 'hint', style: { maxWidth: '58ch' }, text: 'A rehearsal of the live monitor on invented recipients — no mail is sent. It draws each gap from the same 5s–2m random window a real campaign uses, so pacing looks exactly as it will in production.' })
+          el('p', { class: 'hint', style: { maxWidth: '58ch' }, text: 'A rehearsal of the live monitor on invented recipients — no mail is sent. It draws each gap the same way a real campaign does — mostly 5–10s, sometimes longer, rarely near the 2m ceiling — so pacing looks exactly as it will in production.' })
         ]),
         el('div', { class: 'row row--wrap' }, [livePill, speed, btnToggle, btnReset])
       ]),
-
-      railParts.rail,
-      el('hr', { class: 'divider' }),
 
       el('div', { class: 'row', style: { gap: '30px', flexWrap: 'wrap', alignItems: 'center' } }, [
         ring,
@@ -757,18 +717,6 @@
     const next = demo.recipients[demo.cursor];
     n.current.textContent = demo.running && next ? 'Now sending to ' + next.email + ' — “Hello ' + next.first + ', …”' : '';
 
-    // Rail: only alive while the campaign is.
-    n.rail.classList.toggle('is-live', demo.running);
-    const rn = n.railNodes;
-    rn.list.dataset.on = '1';
-    rn.engine.dataset.on = demo.running ? '1' : '0';
-    rn.mailbox.dataset.on = demo.running ? '1' : '0';
-    rn.out.dataset.on = s.sent ? '1' : '0';
-    $('.sub', rn.list).textContent = fmtNum(s.queued) + ' still queued';
-    $('.sub', rn.engine).textContent = demo.running ? 'pacing 5s–2m' : done ? 'finished' : 'idle';
-    $('.sub', rn.mailbox).textContent = demo.running && next ? 'one at a time' : 'connected';
-    $('.sub', rn.out).textContent = s.sent ? fmtNum(s.sent) + ' reached' : 'personalised';
-
     n.tbody.innerHTML = '';
     demo.recipients.forEach((r) => {
       n.tbody.appendChild(el('tr', {}, [
@@ -797,7 +745,7 @@
         // Name the gap that was actually drawn, so the randomness is visible
         // rather than something the user has to take on trust.
         n.countdownFoot.textContent = 'waiting ' + fmtDuration(demo.pendingGap, true) +
-          ', drawn at random from 5s–2m' + (demo.speed > 1 ? ' (played ×' + demo.speed + ')' : '');
+          ', drawn at random (mostly 5–10s, up to 2m)' + (demo.speed > 1 ? ' (played ×' + demo.speed + ')' : '');
       } else {
         n.countdown.textContent = '--:--';
         n.countdownFoot.textContent = demo.running ? '' : 'paused';
@@ -931,7 +879,9 @@
     const min = p.minDelayMs != null ? p.minDelayMs : 5000;
     const max = p.maxDelayMs != null ? p.maxDelayMs : 120000;
     if (p.randomize === false) return 'every ' + fmtDuration(min, true) + ', fixed';
-    return fmtDuration(min, true) + '–' + fmtDuration(max, true) + ', randomised';
+    // The draw is weighted toward the short end, so "min–max" alone would
+    // misdescribe it; say where the mass actually sits.
+    return fmtDuration(min, true) + '–' + fmtDuration(max, true) + ', mostly near ' + fmtDuration(min, true);
   }
 
   function infoRow(label, value) {
@@ -1671,7 +1621,7 @@
 
     // ---- 4. pacing ----
     function renderPacing() {
-      const defaults = (state.settings && state.settings.pacing) || { minDelayMs: 5000, maxDelayMs: 120000, randomize: true, hourlyCap: 60, dailyCap: 400 };
+      const defaults = (state.settings && state.settings.pacing) || { minDelayMs: 5000, maxDelayMs: 120000, randomize: true, hourlyCap: 200, dailyCap: 1500 };
       draft.pacing = draft.pacing || Object.assign({}, defaults);
       const p = draft.pacing;
 
@@ -1828,7 +1778,17 @@
       .join('');
   }
 
-  const avgGap = (p) => Math.max(1, p.randomize ? (p.minDelayMs + p.maxDelayMs) / 2 : p.minDelayMs);
+  /**
+   * Mean gap under the weighted draw - about 22s on the default window, not the
+   * 62s a uniform midpoint would suggest. Mirrors expectedDelay() on the server.
+   */
+  const avgGap = (p) => {
+    if (!p.randomize) return Math.max(1, p.minDelayMs);
+    const min = p.minDelayMs, max = p.maxDelayMs;
+    const total = DEMO.buckets.reduce((sum, b) => sum + b.weight, 0);
+    const canonMean = DEMO.buckets.reduce((sum, b) => sum + b.weight * ((b.from + b.to) / 2), 0) / total;
+    return Math.max(1, min + ((canonMean - 5000) / (120000 - 5000)) * (max - min));
+  };
 
   /** Mirrors estimateDuration on the server: caps only bind on longer lists. */
   function estimateMs(p, count) {
@@ -2010,9 +1970,6 @@
     const countdown = el('span', { class: 'num', style: { fontSize: '34px', letterSpacing: '-0.045em', fontWeight: '300' }, text: '--:--' });
 
     shell.appendChild(el('div', { class: 'card card--pad-lg', style: { marginBottom: '14px' } }, [
-      railParts.rail,
-      el('hr', { class: 'divider' }),
-
       el('div', { class: 'row', style: { gap: '30px', flexWrap: 'wrap', alignItems: 'center' } }, [
         ring,
         el('div', { style: { flex: '1', minWidth: '260px' } }, [

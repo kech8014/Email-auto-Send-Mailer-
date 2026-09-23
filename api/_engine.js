@@ -30,12 +30,21 @@ const SUPPRESSION_KEY = 'suppression';
 
 // ---------------------------------------------------------------- defaults --
 
+/**
+ * Caps are our own guard rails, sized to sit under what the provider already
+ * allows - not a way around anything it enforces. 200/hour matches the weighted
+ * gap distribution (mean ~22s, so ~160/hour) with headroom; 1500/day stays
+ * inside Google Workspace's 2,000/day.
+ *
+ * Free consumer Gmail is 500/day, and a domain with no sending history should
+ * be warmed up well below either. Both are editable in Settings.
+ */
 const DEFAULT_PACING = {
   minDelayMs: 5000,
   maxDelayMs: 120000,
   randomize: true,
-  hourlyCap: 60,
-  dailyCap: 400
+  hourlyCap: 200,
+  dailyCap: 1500
 };
 
 const DEFAULT_RETRY = {
@@ -308,11 +317,57 @@ function textFromHtml(html) {
 
 // ------------------------------------------------------------------ pacing --
 
+/**
+ * Weighted gap distribution across the pacing window.
+ *
+ * A uniform draw over 5s-2m produces a suspiciously even rhythm: every gap is
+ * equally likely, so the mean is always ~62s and the spread is flat. Real human
+ * sending is bursty - mostly quick, occasionally distracted. These buckets
+ * reproduce that shape: most messages follow closely, a few pause, and a small
+ * tail waits out most of the window.
+ *
+ * Bounds are expressed against the canonical 5s-2m window and rescaled to
+ * whatever window is actually configured, so a custom min/max keeps the shape.
+ */
+const GAP_BUCKETS = [
+  { from: 5000, to: 10000, weight: 55 },    // mostly: follows straight on
+  { from: 10000, to: 30000, weight: 25 },   // some: a short pause
+  { from: 30000, to: 80000, weight: 15 },   // some: a longer one
+  { from: 80000, to: 120000, weight: 5 }    // rarely: near the ceiling
+];
+const GAP_WEIGHT_TOTAL = GAP_BUCKETS.reduce((sum, b) => sum + b.weight, 0);
+const CANON_MIN = 5000;
+const CANON_MAX = 120000;
+
 function nextDelay(pacing) {
   const min = Math.max(1000, Number(pacing.minDelayMs) || DEFAULT_PACING.minDelayMs);
   const max = Math.max(min, Number(pacing.maxDelayMs) || DEFAULT_PACING.maxDelayMs);
   if (pacing.randomize === false) return min;
-  return min + Math.floor(Math.random() * (max - min + 1));
+
+  let roll = Math.random() * GAP_WEIGHT_TOTAL;
+  let bucket = GAP_BUCKETS[GAP_BUCKETS.length - 1];
+  for (const b of GAP_BUCKETS) {
+    if (roll < b.weight) { bucket = b; break; }
+    roll -= b.weight;
+  }
+
+  // Map the bucket onto the configured window, then draw uniformly inside it.
+  const scale = (v) => min + ((v - CANON_MIN) / (CANON_MAX - CANON_MIN)) * (max - min);
+  const lo = Math.max(min, Math.min(max, scale(bucket.from)));
+  const hi = Math.max(lo, Math.min(max, scale(bucket.to)));
+  return Math.round(lo + Math.random() * (hi - lo));
+}
+
+/**
+ * Mean gap under the weighted distribution - roughly 22s on the default window,
+ * not the 62s a uniform draw would give. Estimates depend on this being right.
+ */
+function expectedDelay(pacing) {
+  const min = Math.max(1000, Number(pacing.minDelayMs) || DEFAULT_PACING.minDelayMs);
+  const max = Math.max(min, Number(pacing.maxDelayMs) || DEFAULT_PACING.maxDelayMs);
+  if (pacing.randomize === false) return min;
+  const canonMean = GAP_BUCKETS.reduce((sum, b) => sum + b.weight * ((b.from + b.to) / 2), 0) / GAP_WEIGHT_TOTAL;
+  return min + ((canonMean - CANON_MIN) / (CANON_MAX - CANON_MIN)) * (max - min);
 }
 
 /**
@@ -494,7 +549,7 @@ async function preflight(meta, conn) {
 function estimateDuration(meta) {
   const pacing = meta.pacing || DEFAULT_PACING;
   const remaining = meta.stats.total - meta.stats.sent - meta.stats.failed - meta.stats.skipped;
-  const avg = pacing.randomize === false ? pacing.minDelayMs : (pacing.minDelayMs + pacing.maxDelayMs) / 2;
+  const avg = expectedDelay(pacing);
   let ms = remaining * avg;
 
   // A cap only stretches the estimate once the list is long enough to hit it;
@@ -554,6 +609,7 @@ module.exports = {
   escapeHtml,
   textFromHtml,
   nextDelay,
+  expectedDelay,
   capStatus,
   createCampaign,
   listCampaigns,

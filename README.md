@@ -18,9 +18,9 @@ There is no open tracking, no click tracking, no invented delivery metrics.
 | Recipients | CSV/XLSX import, delimiter and header detection, Unicode, quoted fields, email-column detection, personalization-role detection, normalization, de-duplication, malformed-address flagging, preview table |
 | Composer | Subject and body with `{{merge_field}}` tokens from any detected column, rich text and raw HTML modes, live rendered preview, multi-attachment drag-and-drop with size validation |
 | Preflight | Blocks the start on missing/invalid addresses, missing merge values, oversized attachments, a disconnected mailbox, duplicates, or cap conflicts — with a confirmation panel before the first send |
-| Sending | **Every message waits a fresh random gap drawn uniformly from 5s–2m** (`DEFAULT_PACING` in `api/_engine.js`), hourly (60) and daily (400) caps, exponential backoff on transient errors, permanent-failure classification, pause / resume / stop, retry-failed |
+| Sending | **Every message waits a fresh random gap, weighted toward the short end of a 5s–2m window** (`GAP_BUCKETS` in `api/_engine.js`), hourly (200) and daily (1500) caps, exponential backoff on transient errors, permanent-failure classification, pause / resume / stop, retry-failed |
 | Monitoring | SSE live feed with per-recipient state, progress, current rate, ETA, elapsed time, next-send countdown, timestamped activity log |
-| Sample campaign | A dashboard rehearsal of the live monitor on invented recipients — an automation rail, progress ring, per-recipient table and activity feed, drawing its gaps from the same 5s–2m window. Nothing is sent; a fast-forward control compresses the wait without distorting the reported rate or ETA |
+| Sample campaign | A dashboard rehearsal of the live monitor on invented recipients — progress ring, per-recipient table and activity feed, drawing its gaps from the same weighted distribution. Nothing is sent; a fast-forward control compresses the wait without distorting the reported rate or ETA |
 | History | Every campaign with counts, duration, status and attachments; open one to inspect every recipient and event |
 | Compliance | `List-Unsubscribe` header on every message, suppression list, plain-text alternative generated from the HTML |
 
@@ -183,18 +183,35 @@ key — `_view.js` projects every stored object before it leaves the server.
 Pacing is the part most likely to get a domain in trouble, so it is worth being
 precise about what the code does.
 
-`nextDelay()` draws a fresh uniform random value in `[minDelayMs, maxDelayMs]`
-before **every** message — default `5000`–`120000`, i.e. 5 seconds to 2 minutes.
-It is not an average and not a fixed cadence: consecutive gaps differ, which is
-the point. On top of that sit rolling hourly (60) and daily (400) caps; when one
-binds, the campaign reports `blocked` with the time it will resume rather than
-pushing through.
+`nextDelay()` draws a fresh random gap before **every** message. The draw is not
+uniform — a flat distribution over 5s–2m produces a suspiciously even rhythm
+where every gap is equally likely. Real sending is bursty: mostly quick, with
+the occasional pause. `GAP_BUCKETS` reproduces that shape:
+
+| Gap | Share | Reads as |
+| --- | --- | --- |
+| 5–10s | 55% | follows straight on |
+| 10–30s | 25% | a short pause |
+| 30s–1m20 | 15% | a longer one |
+| 1m20–2m | 5% | rarely, near the ceiling |
+
+Mean gap ~22s, so roughly 160 messages/hour. Bucket bounds are expressed against
+the canonical 5s–2m window and rescaled to whatever window is configured, so a
+custom min/max keeps the same shape. `expectedDelay()` derives the mean from the
+same table — every duration estimate in the app reads from it rather than
+assuming a midpoint.
+
+Rolling caps sit on top: **200/hour** and **1500/day** by default, chosen to sit
+above the distribution's natural ~160/hour so the cap does not fight the pacing,
+and below Google Workspace's 2,000/day. Free consumer Gmail is 500/day, and a
+domain with no sending history should be warmed up well below either — both are
+editable in Settings. When a cap binds, the campaign reports `blocked` with the
+time it will resume rather than pushing through.
 
 The window is visible in three places: the **Sending gap** row on the dashboard
 identity card, the countdown on the live monitor, and the sample campaign, which
-names the gap it actually drew (“waiting 1m 10s, drawn at random from 5s–2m”).
-All three read the same settings, so changing the policy in Settings changes
-every readout.
+names the gap it actually drew (“waiting 8s, drawn at random (mostly 5–10s, up
+to 2m)”). All three read the same settings.
 
 This is self-restraint, not evasion. It exists to stay comfortably inside what a
 provider already permits — when the provider itself returns a limit or an error,
