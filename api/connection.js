@@ -179,6 +179,16 @@ module.exports = http.protect(async (req, res) => {
     case 'get':
       result = { status: 200, payload: { connection: engine.publicConnection(await engine.getConnection()) } };
       break;
+    // The display name recipients see. Changing it is not a credential change,
+    // so it must not require re-entering the password or re-testing the server.
+    case 'set-name': {
+      const conn = await engine.getConnection();
+      if (!conn) { result = { status: 404, payload: { error: 'No mailbox connected' } }; break; }
+      conn.fromName = String(body.fromName || '').trim().slice(0, 120) || null;
+      await store.set('connection', conn);
+      result = { status: 200, payload: { connection: engine.publicConnection(conn) } };
+      break;
+    }
     case 'disconnect':
       await store.del('connection');
       result = { status: 200, payload: { ok: true } };

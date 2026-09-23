@@ -692,6 +692,54 @@
     }
   }
 
+  /**
+   * The name recipients actually see in their inbox, next to the address.
+   * Editable on its own: it is not a credential, so changing it should not mean
+   * re-entering a password and re-testing the servers.
+   */
+  function senderNameField() {
+    const conn = state.connection;
+    const input = el('input', {
+      class: 'input',
+      value: conn.fromName || '',
+      placeholder: 'e.g. Sarah Chen, or Kech Legal Outreach',
+      maxlength: '120'
+    });
+    const preview = el('p', { class: 'hint', style: { marginTop: '8px' } });
+    const paint = () => {
+      const name = input.value.trim();
+      preview.textContent = 'Recipients will see: ' + (name ? name + '  <' + conn.email + '>' : conn.email);
+    };
+    input.addEventListener('input', paint);
+    paint();
+
+    const save = el('button', { class: 'btn', text: 'Save name', onclick: async () => {
+      save.disabled = true;
+      const label = save.textContent;
+      save.textContent = 'Saving…';
+      try {
+        const data = await api('connection', { action: 'set-name', fromName: input.value });
+        state.connection = data.connection;
+        updateChrome();
+        toast('Sender name updated', 'ok');
+        paint();
+      } catch (err) {
+        toast(err.message, 'err');
+      } finally {
+        save.disabled = false;
+        save.textContent = label;
+      }
+    } });
+
+    return el('div', {}, [
+      el('span', { class: 'label', text: 'Sender name' }),
+      el('div', { class: 'row', style: { marginTop: '8px', gap: '10px', alignItems: 'flex-start' } }, [
+        el('div', { style: { flex: '1', minWidth: '0' } }, [input, preview]),
+        save
+      ])
+    ]);
+  }
+
   function connectedPanel() {
     const conn = state.connection;
     const health = conn.health || { state: 'unknown' };
@@ -714,6 +762,8 @@
           el('span', { class: 'pill ' + cls }, [el('span', { class: 'dot' }), el('span', { text })])
         ]),
         health.message ? el('p', { class: 'hint', style: { marginBottom: '16px' }, text: health.message }) : null,
+        el('hr', { class: 'divider' }),
+        senderNameField(),
         el('hr', { class: 'divider' }),
         el('div', { class: 'grid grid--2' }, [
           el('div', {}, [
@@ -1174,6 +1224,10 @@
         else frame.appendChild(el('pre', { style: { whiteSpace: 'pre-wrap', margin: '0', fontFamily: 'inherit' }, text: rendered || 'This row has an empty body.' }));
         previewBox.appendChild(frame);
       };
+
+      // The sender name is the first thing a recipient reads; make it fixable
+      // here rather than only behind the connection form.
+      messageSection.appendChild(el('div', { class: 'card card--flat', style: { marginBottom: '18px' } }, [senderNameField()]));
 
       messageSection.appendChild(el('div', { class: 'between', style: { marginBottom: '10px' } }, [
         el('span', { class: 'label', text: 'Live preview' }),

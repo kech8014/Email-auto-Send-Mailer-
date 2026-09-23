@@ -286,13 +286,62 @@ function render(template, fields, fallbacks, options) {
   const lookup = buildLookup(fields);
   const emit = (value) => (html ? escapeHtml(value).replace(/\r\n|\r|\n/g, '<br>') : value);
 
-  return String(template).replace(/\{\{\s*([^}|]+?)\s*(?:\|\s*([^}]*?)\s*)?\}\}/g, (match, token, fallback) => {
+  const pass = (input) => String(input).replace(/\{\{\s*([^}|]+?)\s*(?:\|\s*([^}]*?)\s*)?\}\}/g, (match, token, fallback) => {
     const value = lookup.get(normalizeKey(token));
     if (value != null && String(value).trim() !== '') return emit(String(value).trim());
     if (fallback != null) return emit(fallback);
     if (fallbacks && fallbacks[normalizeKey(token)] != null) return emit(String(fallbacks[normalizeKey(token)]));
     return '';
   });
+
+  // A spreadsheet cell can itself contain {{tokens}} - a subject column holding
+  // "Quick note for {{first_name}}" is common when the sheet was generated from
+  // another template. One pass would substitute the cell and stop, mailing the
+  // raw token to the recipient. Run a second pass so those resolve too, bounded
+  // at two so a self-referential value cannot loop.
+  let out = pass(template);
+  if (out.indexOf('{{') !== -1) out = pass(out);
+  return out;
+}
+
+/** Tokens still unresolved after rendering - what the recipient would actually see. */
+function leftoverTokens(rendered) {
+  const found = new Set();
+  const re = /\{\{\s*([^}|]+?)\s*(?:\|[^}]*)?\}\}/g;
+  let m;
+  while ((m = re.exec(String(rendered || '')))) found.add(m[1].trim());
+  return [...found];
+}
+
+/**
+ * Tokens that surface once the spreadsheet values are substituted in, but which
+ * no column can fill - so they are silently dropped and the recipient reads
+ * "Hello ," instead of "Hello Allan,".
+ *
+ * These cannot be found by inspecting the template: they live inside the data.
+ * A subject column holding "Quick note for {{first_name}}" only reveals the
+ * problem after the first substitution, which is what this reproduces.
+ */
+function pendingTokens(template, fields) {
+  if (!template) return [];
+  const lookup = buildLookup(fields);
+  const firstPass = String(template).replace(/\{\{\s*([^}|]+?)\s*(?:\|\s*([^}]*?)\s*)?\}\}/g, (match, token, fallback) => {
+    const value = lookup.get(normalizeKey(token));
+    if (value != null && String(value).trim() !== '') return String(value).trim();
+    return fallback != null ? fallback : '';
+  });
+  // Anything still token-shaped came out of the data; report the ones no column
+  // and no inline fallback can satisfy.
+  const re = /\{\{\s*([^}|]+?)\s*(?:\|\s*([^}]*?)\s*)?\}\}/g;
+  const unfillable = new Set();
+  let m;
+  while ((m = re.exec(firstPass))) {
+    const token = m[1].trim();
+    const hasValue = lookup.get(normalizeKey(token));
+    const hasFallback = m[2] != null;
+    if (!hasFallback && (hasValue == null || String(hasValue).trim() === '')) unfillable.add(token);
+  }
+  return [...unfillable];
 }
 
 /** Which tokens a template uses, and which of them the spreadsheet can fill. */
@@ -536,6 +585,34 @@ async function preflight(meta, conn) {
     add('pass', (subjectTokens.length + bodyTokens.length) + ' personalisation variables resolved', [...new Set([...subjectTokens, ...bodyTokens].map((t) => t.token))].join(', '));
   }
 
+  /**
+   * The checks above inspect the template. That is not enough: when the subject
+   * and body come from spreadsheet columns, the tokens live in the data, and a
+   * sheet generated from another template can arrive with {{first_name}} still
+   * unfilled. Render real rows and look at what the recipient would actually
+   * receive - the only view that catches it.
+   */
+  const sample = await readRecipients(meta.id, 0, 25);
+  const stillRaw = new Set();
+  let affected = 0;
+  for (const row of sample) {
+    const fields = Object.assign({}, row.fields, { email: row.email });
+    const leftovers = [
+      ...pendingTokens(meta.subject, fields),
+      ...pendingTokens(meta.body, fields),
+      ...leftoverTokens(render(meta.subject, fields)),
+      ...leftoverTokens(render(meta.body, fields, null, { html: Boolean(meta.isHtml) }))
+    ];
+    if (leftovers.length) { affected += 1; leftovers.forEach((t) => stillRaw.add(t)); }
+  }
+  if (stillRaw.size) {
+    add('error', 'Unfilled placeholders in your content',
+      [...stillRaw].map((t) => '{{' + t + '}}').join(', ') + ' appears in the text of ' + affected +
+      ' of the first ' + sample.length + ' rows, and no column can fill it. Recipients would see a gap where the name should be. Add a matching column to the spreadsheet, fill the text in, or write a fallback like {{first_name|there}}.');
+  } else if (sample.length) {
+    add('pass', 'Rendered content is clean', 'No unfilled placeholders in the first ' + sample.length + ' rows');
+  }
+
   const totalAttachmentBytes = (meta.attachments || []).reduce((sum, a) => sum + (a.size || 0), 0);
   if (totalAttachmentBytes > 20 * 1024 * 1024) {
     add('error', 'Attachments too large', formatBytes(totalAttachmentBytes) + ' exceeds the 20 MB ceiling most mailboxes accept.');
@@ -619,6 +696,8 @@ module.exports = {
   isValidEmail,
   render,
   analyseTokens,
+  pendingTokens,
+  leftoverTokens,
   escapeHtml,
   textFromHtml,
   nextDelay,
