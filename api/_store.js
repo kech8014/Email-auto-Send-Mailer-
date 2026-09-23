@@ -42,7 +42,12 @@ async function blobGet(key) {
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
-    if (err && /not found|BlobNotFound/i.test(String(err.message))) return null;
+    // A key that was never written is a miss, not a failure. Match on the error
+    // class first: the SDK's message wording ("The requested blob does not
+    // exist") is not stable enough to detect on its own.
+    const name = String((err && err.name) || '');
+    const message = String((err && err.message) || '');
+    if (name === 'BlobNotFoundError' || /not ?found|does not exist/i.test(message)) return null;
     throw err;
   }
 }

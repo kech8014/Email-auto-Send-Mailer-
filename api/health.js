@@ -28,15 +28,20 @@ module.exports = async (req, res) => {
     }
     checks.activeCampaigns = active;
   } catch (err) {
-    checks.storeError = 'unreachable';
+    // Name the failure class so a broken store is debuggable from the probe
+    // alone, without putting credentials or URLs in an unauthenticated response.
+    checks.storeError = String((err && err.name) || 'Error');
   }
 
   const warnings = [];
   if (!checks.store.durable) warnings.push('No persistent store configured - campaign state will not survive a cold start. Set KV_REST_API_URL/TOKEN or BLOB_READ_WRITE_TOKEN.');
   if (!checks.secretKeyConfigured) warnings.push('SECRET_KEY is not set - secrets fall back to the access code.');
   if (!checks.baseUrl) warnings.push('No public base URL - the worker cannot chain itself.');
+  if (checks.storeError) warnings.push('Store configured but not readable (' + checks.storeError + ') - campaigns cannot persist.');
 
-  const healthy = checks.store.durable !== false || process.env.NODE_ENV !== 'production';
+  // A store that is configured but unreadable is worse than no store at all:
+  // the app would believe it is durable and silently lose campaign state.
+  const healthy = !checks.storeError && (checks.store.durable !== false || process.env.NODE_ENV !== 'production');
 
   res.statusCode = healthy ? 200 : 503;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
