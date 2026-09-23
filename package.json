@@ -1,0 +1,11 @@
+{
+  "name": "kech-mailer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Encrypted, resumable email campaign automation console",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@vercel/blob": "^0.27.3",
+    "nodemailer": "^6.9.16"
+  }
+}

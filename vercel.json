@@ -1,0 +1,28 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/tick.js": { "maxDuration": 60, "memory": 1024 },
+    "api/stream.js": { "maxDuration": 60, "memory": 512 },
+    "api/connection.js": { "maxDuration": 60, "memory": 512 },
+    "api/campaign.js": { "maxDuration": 60, "memory": 1024 },
+    "api/upload.js": { "maxDuration": 30, "memory": 1024 }
+  },
+  "crons": [
+    { "path": "/api/tick?sweep=1", "schedule": "0 * * * *" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "Permissions-Policy", "value": "geolocation=(), microphone=(), camera=()" }
+      ]
+    },
+    {
+      "source": "/assets/(.*)",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }]
+    }
+  ]
+}
