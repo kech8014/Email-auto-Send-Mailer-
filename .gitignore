@@ -10,3 +10,6 @@ node_modules
 .agents/
 .claude/
 skills-lock.json
+
+# Throwaway diagnostic scripts.
+*.tmp.js
