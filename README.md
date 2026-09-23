@@ -1,5 +1,9 @@
 # Kech — Campaign Automation
 
+**Live:** https://kechautoemail.vercel.app · **Source:** https://github.com/kech8014/Email-auto-Send-Mailer-
+
+Pushing to `main` deploys to production automatically.
+
 A self-hosted email campaign console. Connect your own mailbox over SMTP, upload
 a recipient spreadsheet, write the message once, and the campaign runs on the
 server at a deliberately human pace — it keeps running with the browser closed,
