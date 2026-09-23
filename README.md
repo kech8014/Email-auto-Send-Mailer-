@@ -4,6 +4,11 @@
 
 Pushing to `main` deploys to production automatically.
 
+> **The access code is currently the built-in default, `kech`.** It is published
+> in this repository, so the console is not private: anyone who can reach the URL
+> can sign in and send mail from whatever mailbox is connected. Set `ACCESS_CODE`
+> in the Vercel environment to change that.
+
 A self-hosted email campaign console. Connect your own mailbox over SMTP, upload
 a recipient spreadsheet, write the message once, and the campaign runs on the
 server at a deliberately human pace — it keeps running with the browser closed,
@@ -24,7 +29,6 @@ There is no open tracking, no click tracking, no invented delivery metrics.
 | Preflight | Blocks the start on missing/invalid addresses, missing merge values, oversized attachments, a disconnected mailbox, duplicates, or cap conflicts — with a confirmation panel before the first send |
 | Sending | **Every message waits a fresh random gap, weighted toward the short end of a 5s–2m window** (`GAP_BUCKETS` in `api/_engine.js`), hourly (200) and daily (1500) caps, exponential backoff on transient errors, permanent-failure classification, pause / resume / stop, retry-failed |
 | Monitoring | SSE live feed with per-recipient state, progress, current rate, ETA, elapsed time, next-send countdown, timestamped activity log |
-| Sample campaign | A dashboard rehearsal of the live monitor on invented recipients — progress ring, per-recipient table and activity feed, drawing its gaps from the same weighted distribution. Nothing is sent; a fast-forward control compresses the wait without distorting the reported rate or ETA |
 | History | Every campaign with counts, duration, status and attachments; open one to inspect every recipient and event |
 | Compliance | `List-Unsubscribe` header on every message, suppression list, plain-text alternative generated from the HTML |
 
@@ -126,7 +130,7 @@ boundary (sealed passwords, tampered sessions, campaign-scoped worker tokens).
 
    | Variable | Required | Purpose |
    | --- | --- | --- |
-   | `ACCESS_CODE` | yes | console entry |
+   | `ACCESS_CODE` | strongly recommended | console entry; falls back to the published default `kech` when unset |
    | `SECRET_KEY` | yes | seals credentials, signs sessions and worker tokens |
    | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | one store | persistence |
    | `BLOB_READ_WRITE_TOKEN` | one store | persistence (alternative) |
@@ -212,10 +216,9 @@ domain with no sending history should be warmed up well below either — both ar
 editable in Settings. When a cap binds, the campaign reports `blocked` with the
 time it will resume rather than pushing through.
 
-The window is visible in three places: the **Sending gap** row on the dashboard
-identity card, the countdown on the live monitor, and the sample campaign, which
-names the gap it actually drew (“waiting 8s, drawn at random (mostly 5–10s, up
-to 2m)”). All three read the same settings.
+The window is visible in two places: the **Sending gap** row on the dashboard
+identity card and the countdown on the live monitor. Both read the same
+settings.
 
 This is self-restraint, not evasion. It exists to stay comfortably inside what a
 provider already permits — when the provider itself returns a limit or an error,

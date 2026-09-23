@@ -57,6 +57,18 @@
     return s + 's';
   }
 
+  /**
+   * Mirrors GAP_BUCKETS in api/_engine.js. Duplicated because the browser cannot
+   * require server modules; keep the two in step or client-side duration
+   * estimates will disagree with what the worker actually does.
+   */
+  const GAP_BUCKETS = [
+    { from: 5000, to: 10000, weight: 55 },
+    { from: 10000, to: 30000, weight: 25 },
+    { from: 30000, to: 80000, weight: 15 },
+    { from: 80000, to: 120000, weight: 5 }
+  ];
+
   const fmtClock = (ms) => {
     const t = Math.max(0, Math.round(ms / 1000));
     return String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
@@ -380,380 +392,6 @@
   }
 
   // ==========================================================================
-  //  SAMPLE CAMPAIGN  (simulation)
-  // ==========================================================================
-
-  /**
-   * A self-contained rehearsal of the live monitor, so the shape of a running
-   * campaign can be seen before a mailbox is connected or a list uploaded.
-   *
-   * Nothing here touches the network: the recipients are invented, and no mail
-   * is sent. It is time-compressed on purpose - a real campaign paces itself at
-   * 5s-2m between messages, which is unwatchable. Every other behaviour is
-   * modelled honestly, including the transient retry and the permanent bounce,
-   * because those are the moments worth recognising.
-   */
-  const DEMO = {
-    firms: [
-      ['Alexandra', 'Reyes', 'Reyes & Calloway LLP', 'Brooklyn', 'Kings'],
-      ['Marcus', 'Hale', 'Hale Family Law', 'White Plains', 'Westchester'],
-      ['Priya', 'Nandakumar', 'Nandakumar Legal', 'Queens', 'Queens'],
-      ['Daniel', 'Okafor', 'Okafor & Stein', 'Manhattan', 'New York'],
-      ['Sofia', 'Marchetti', 'Marchetti Matrimonial', 'Yonkers', 'Westchester'],
-      ['Jonathan', 'Weiss', 'Weiss Advocates', 'Garden City', 'Nassau'],
-      ['Grace', 'Lindqvist', 'Lindqvist Law Group', 'Buffalo', 'Erie'],
-      ['Omar', 'Haddad', 'Haddad Counsel', 'Rochester', 'Monroe'],
-      ['Eleanor', 'Whitfield', 'Whitfield & Roe', 'Albany', 'Albany'],
-      ['Tobias', 'Braun', 'Braun Family Practice', 'Syracuse', 'Onondaga'],
-      ['Renata', 'Silva', 'Silva Legal Partners', 'Staten Island', 'Richmond'],
-      ['Aaron', 'Kimura', 'Kimura Law Offices', 'Bronx', 'Bronx'],
-      ['Helena', 'Vasquez', 'Vasquez Matrimonial', 'Hempstead', 'Nassau'],
-      ['Nathaniel', 'Crowe', 'Crowe & Associates', 'Poughkeepsie', 'Dutchess'],
-      ['Ingrid', 'Solberg', 'Solberg Family Law', 'Ithaca', 'Tompkins'],
-      ['Victor', 'Abramov', 'Abramov Legal', 'Brooklyn', 'Kings'],
-      ['Camille', 'Beaumont', 'Beaumont Counsel', 'Manhattan', 'New York'],
-      ['Isaac', 'Mendelsohn', 'Mendelsohn & Frye', 'Mineola', 'Nassau']
-    ],
-    // Fixed outcomes, so the rehearsal always shows a retry and a bounce.
-    scripted: { 4: 'retry', 9: 'bounce', 14: 'retry' },
-    // Mirrors GAP_BUCKETS in api/_engine.js - keep the two in step, or the
-    // rehearsal stops predicting what production will actually do.
-    buckets: [
-      { from: 5000, to: 10000, weight: 55 },
-      { from: 10000, to: 30000, weight: 25 },
-      { from: 30000, to: 80000, weight: 15 },
-      { from: 80000, to: 120000, weight: 5 }
-    ]
-  };
-
-  function demoDrawGap() {
-    const total = DEMO.buckets.reduce((sum, b) => sum + b.weight, 0);
-    let roll = Math.random() * total;
-    let bucket = DEMO.buckets[DEMO.buckets.length - 1];
-    for (const b of DEMO.buckets) {
-      if (roll < b.weight) { bucket = b; break; }
-      roll -= b.weight;
-    }
-    return Math.round(bucket.from + Math.random() * (bucket.to - bucket.from));
-  }
-
-  const demo = {
-    timer: null,
-    tick: null,
-    running: false,
-    recipients: [],
-    events: [],
-    cursor: 0,
-    startedAt: 0,
-    nextAt: 0,
-    sentAt: [],
-    gaps: [],
-    pendingGap: 0,
-    nodes: null,
-    speed: 1            // 1 = real time; >1 fast-forwards the rehearsal only
-  };
-
-  function demoSlug(first, last, firm) {
-    const host = firm.toLowerCase().replace(/[^a-z]+/g, '').slice(0, 14) + '.example';
-    return first[0].toLowerCase() + last.toLowerCase().replace(/[^a-z]/g, '') + '@' + host;
-  }
-
-  function demoReset() {
-    demoStop();
-    demo.recipients = DEMO.firms.map((f, i) => ({
-      email: demoSlug(f[0], f[1], f[2]),
-      first: f[0], firm: f[2], city: f[3], county: f[4],
-      state: 'queued', attempts: 0, at: null, error: null,
-      script: DEMO.scripted[i] || null
-    }));
-    demo.events = [];
-    demo.cursor = 0;
-    demo.sentAt = [];
-    demo.gaps = [];
-    demo.pendingGap = 0;
-    demo.startedAt = 0;
-    demo.nextAt = 0;
-    demo.running = false;
-  }
-
-  function demoEvent(type, message, detail) {
-    demo.events.unshift({ t: Date.now(), type, message, detail: detail || '' });
-    if (demo.events.length > 60) demo.events.pop();
-  }
-
-  function demoStop() {
-    clearTimeout(demo.timer);
-    clearInterval(demo.tick);
-    demo.timer = null;
-    demo.tick = null;
-  }
-
-  function demoStart() {
-    if (demo.running) return;
-    if (demo.cursor === 0) {
-      demo.startedAt = Date.now();
-      demoEvent('connection', 'Connected to SMTP', 'smtp.example.com:465 · TLS');
-      demoEvent('campaign', 'Personalization loaded', '5 merge fields across ' + demo.recipients.length + ' rows');
-      demoEvent('campaign', 'Sample campaign started', 'Simulation — no mail leaves this browser');
-    } else {
-      demoEvent('campaign', 'Sample campaign resumed');
-    }
-    demo.running = true;
-    demoSchedule();
-    demoPaint();
-  }
-
-  function demoPause() {
-    if (!demo.running) return;
-    demo.running = false;
-    demoStop();
-    demoEvent('pacing', 'Sample campaign paused');
-    demoPaint();
-  }
-
-  /**
-   * Same uniform draw across the same 5s-2m window the server uses, so the
-   * rehearsal shows the real rhythm. The speed divisor only compresses the
-   * wall-clock wait; the gap that gets displayed is the true one.
-   */
-  function demoSchedule() {
-    clearTimeout(demo.timer);
-    const gap = demoDrawGap();
-    demo.pendingGap = gap;
-    demo.nextAt = Date.now() + gap / demo.speed;
-    demo.timer = setTimeout(demoSend, gap / demo.speed);
-  }
-
-  function demoSend() {
-    const r = demo.recipients[demo.cursor];
-    if (!r) return demoFinish();
-    r.attempts += 1;
-    // Book the gap we actually waited for, in real-campaign terms.
-    demo.gaps.push(demo.pendingGap);
-
-    if (r.script === 'retry' && r.attempts === 1) {
-      r.state = 'retrying';
-      r.error = '451 4.3.0 Temporary local problem';
-      demoEvent('retry', 'Retry scheduled — ' + r.email, 'Transient 451, backing off before attempt 2');
-    } else if (r.script === 'bounce') {
-      r.state = 'failed';
-      r.at = Date.now();
-      r.error = '550 5.1.1 User unknown';
-      demoEvent('failed', 'Permanent failure — ' + r.email, '550 5.1.1 User unknown · will not retry');
-      demo.cursor += 1;
-    } else {
-      r.state = 'sent';
-      r.at = Date.now();
-      r.error = null;
-      demo.sentAt.push(r.at);
-      demoEvent('sent', 'Email sent — ' + r.email, 'Merged: ' + r.first + ' · ' + r.firm + ' · ' + r.county + ' County');
-      demo.cursor += 1;
-    }
-
-    if (demo.cursor >= demo.recipients.length) return demoFinish();
-    demoSchedule();
-    demoPaint();
-  }
-
-  function demoFinish() {
-    demo.running = false;
-    demoStop();
-    demo.nextAt = 0;
-    demoEvent('campaign', 'Sample campaign completed', demoStats().sent + ' delivered · ' + demoStats().failed + ' failed');
-    demoPaint();
-  }
-
-  function demoStats() {
-    const s = { sent: 0, failed: 0, retrying: 0, queued: 0, total: demo.recipients.length };
-    demo.recipients.forEach((r) => { s[r.state] += 1; });
-    return s;
-  }
-
-  /**
-   * Derived from the drawn gaps rather than the wall clock, so fast-forwarding
-   * the rehearsal does not inflate the rate or shrink the ETA. These are the
-   * numbers a real run at this pacing would show.
-   */
-  function demoMetrics() {
-    const s = demoStats();
-    const done = s.sent + s.failed;
-    const gaps = demo.gaps;
-    const elapsed = gaps.reduce((a, b) => a + b, 0);
-    const avg = gaps.length ? elapsed / gaps.length : 0;
-    return {
-      stats: s,
-      percent: s.total ? (done / s.total) * 100 : 0,
-      remaining: s.total - done,
-      avgIntervalMs: avg,
-      ratePerHour: avg ? Math.round(3600000 / avg) : 0,
-      elapsedMs: elapsed,
-      etaMs: avg && s.total - done > 0 ? avg * (s.total - done) : null
-    };
-  }
-
-  /** Builds the panel once; demoPaint() mutates it in place so nothing flickers. */
-  function demoPanel() {
-    const ring = el('div', { class: 'ring' }, [
-      el('div', { class: 'inner' }, [
-        el('span', { class: 'pct', text: '0%' }),
-        el('span', { class: 'cap', text: 'complete' })
-      ])
-    ]);
-    const meter = el('div', { class: 'meter', style: { marginBottom: '14px' } }, [
-      el('span', { class: 's-sent', style: { width: '0%' } }),
-      el('span', { class: 's-retry', style: { width: '0%' } }),
-      el('span', { class: 's-failed', style: { width: '0%' } })
-    ]);
-    const legendRow = el('div', { class: 'row row--wrap', style: { gap: '20px' } });
-    const countdown = el('span', { class: 'num', style: { fontSize: '30px', letterSpacing: '-0.045em', fontWeight: '300' }, text: '--:--' });
-    const countdownFoot = el('p', { class: 'hint', style: { marginTop: '6px' }, text: '' });
-    const statsRow = el('div', { class: 'grid grid--4', style: { marginTop: '20px' } });
-    const current = el('div', { class: 'hint truncate', style: { marginTop: '16px' }, text: '' });
-    const tbody = el('tbody', {});
-    const feed = el('div', { class: 'feed', style: { maxHeight: '300px' } });
-    const livePill = el('span', { class: 'pill' }, [el('span', { class: 'dot' }), el('span', { class: 'txt', text: 'Idle' })]);
-
-    const btnToggle = el('button', {
-      class: 'btn btn--primary btn--sm',
-      text: 'Run sample',
-      onclick: () => {
-        if (demo.running) return demoPause();
-        // A finished run starts over rather than resuming past the end.
-        if (demo.cursor >= demo.recipients.length) demoReset();
-        demoStart();
-      }
-    });
-    const btnReset = el('button', { class: 'btn btn--sm', text: 'Reset', onclick: () => { demoReset(); demoPaint(); } });
-
-    const speed = el('select', { class: 'select', style: { width: 'auto', minWidth: '140px' }, onchange: (e) => {
-      demo.speed = Number(e.target.value);
-      if (demo.running) demoSchedule();       // apply immediately to the pending wait
-      demoPaint();
-    } }, [
-      el('option', { value: '1', text: 'Real time (5s–2m)' }),
-      el('option', { value: '10', text: 'Fast-forward ×10' }),
-      el('option', { value: '40', text: 'Fast-forward ×40' })
-    ]);
-    speed.value = String(demo.speed);
-
-    demo.nodes = { ring, meter, legendRow, countdown, countdownFoot, statsRow, current, tbody, feed, livePill, btnToggle };
-
-    return el('div', { class: 'card card--glass card--pad-lg', style: { marginTop: '14px' } }, [
-      el('div', { class: 'between', style: { marginBottom: '20px', flexWrap: 'wrap', gap: '14px' } }, [
-        el('div', { style: { minWidth: 0 } }, [
-          el('p', { class: 'eyebrow', text: 'Preview' }),
-          el('h2', { class: 'h-md', style: { margin: '8px 0 6px' }, text: 'Sample campaign in progress' }),
-          el('p', { class: 'hint', style: { maxWidth: '58ch' }, text: 'A rehearsal of the live monitor on invented recipients — no mail is sent. It draws each gap the same way a real campaign does — mostly 5–10s, sometimes longer, rarely near the 2m ceiling — so pacing looks exactly as it will in production.' })
-        ]),
-        el('div', { class: 'row row--wrap' }, [livePill, speed, btnToggle, btnReset])
-      ]),
-
-      el('div', { class: 'row', style: { gap: '30px', flexWrap: 'wrap', alignItems: 'center' } }, [
-        ring,
-        el('div', { style: { flex: '1', minWidth: '240px' } }, [meter, legendRow]),
-        el('div', { style: { minWidth: '140px' } }, [
-          el('span', { class: 'label', text: 'Next send in' }),
-          el('div', { style: { marginTop: '8px' } }, [countdown]),
-          countdownFoot
-        ])
-      ]),
-
-      statsRow,
-      current,
-      el('hr', { class: 'divider' }),
-
-      el('div', { class: 'grid grid--sidebar' }, [
-        el('div', { class: 'table-wrap' }, [
-          el('div', { class: 'table-scroll', style: { maxHeight: '300px' } }, [
-            el('table', { class: 'data' }, [
-              el('thead', {}, [el('tr', {}, [
-                el('th', { text: 'Recipient' }),
-                el('th', { text: 'Merged' }),
-                el('th', { text: 'State' }),
-                el('th', { class: 'num', text: 'Try' })
-              ])]),
-              tbody
-            ])
-          ])
-        ]),
-        el('div', {}, [
-          el('span', { class: 'label', text: 'Activity' }),
-          el('div', { style: { marginTop: '10px' } }, [feed])
-        ])
-      ])
-    ]);
-  }
-
-  function demoPaint() {
-    const n = demo.nodes;
-    if (!n || !document.body.contains(n.ring)) return;
-    const m = demoMetrics();
-    const s = m.stats;
-    const pct = (k) => (s.total ? (s[k] / s.total) * 100 : 0) + '%';
-
-    n.ring.style.setProperty('--p', String(m.percent));
-    $('.pct', n.ring).textContent = m.percent.toFixed(0) + '%';
-    $('.s-sent', n.meter).style.width = pct('sent');
-    $('.s-retry', n.meter).style.width = pct('retrying');
-    $('.s-failed', n.meter).style.width = pct('failed');
-
-    n.legendRow.innerHTML = '';
-    [['Sent', s.sent, 'var(--ok)'], ['Retrying', s.retrying, 'var(--warn)'], ['Failed', s.failed, 'var(--err)'], ['Queued', s.queued, 'var(--faint)']]
-      .forEach(([l, v, c]) => n.legendRow.appendChild(legend(l, v, c)));
-
-    n.statsRow.innerHTML = '';
-    [
-      statCard('Sent', fmtNum(s.sent), '/ ' + fmtNum(s.total), [el('span', { text: fmtNum(m.remaining) + ' remaining' })]),
-      statCard('Rate', fmtNum(m.ratePerHour), '/hr', [el('span', { text: m.avgIntervalMs ? 'avg gap ' + fmtDuration(m.avgIntervalMs, true) : 'measuring…' })]),
-      statCard('Elapsed', fmtDuration(m.elapsedMs, true), null, [el('span', { text: demo.speed > 1 ? 'at real-time pacing' : demo.startedAt ? 'since ' + fmtTime(demo.startedAt) : 'not started' })]),
-      statCard('Remaining', m.etaMs != null ? fmtDuration(m.etaMs, true) : '--', null, [el('span', { text: 'estimated' })])
-    ].forEach((c) => n.statsRow.appendChild(c));
-
-    const done = demo.cursor >= demo.recipients.length;
-    n.livePill.className = 'pill ' + (demo.running ? 'pill--ok pill--live' : done ? 'pill--ok' : '');
-    $('.txt', n.livePill).textContent = demo.running ? 'Running' : done ? 'Completed' : demo.cursor ? 'Paused' : 'Idle';
-    n.btnToggle.textContent = demo.running ? 'Pause' : done ? 'Run again' : demo.cursor ? 'Resume' : 'Run sample';
-
-    const next = demo.recipients[demo.cursor];
-    n.current.textContent = demo.running && next ? 'Now sending to ' + next.email + ' — “Hello ' + next.first + ', …”' : '';
-
-    n.tbody.innerHTML = '';
-    demo.recipients.forEach((r) => {
-      n.tbody.appendChild(el('tr', {}, [
-        el('td', {}, [el('div', { class: 'truncate', style: { maxWidth: '210px' }, title: r.email, text: r.email })]),
-        el('td', {}, [el('span', { class: 'hint truncate', style: { maxWidth: '170px', display: 'block' }, title: r.firm + ' · ' + r.city, text: r.first + ' · ' + r.firm })]),
-        el('td', {}, [el('span', { class: 'state state--' + r.state }, [
-          el('span', { class: 'dot' }),
-          el('span', { text: r.state === 'sent' && r.at ? fmtTime(r.at) : r.error ? r.error.slice(0, 22) : r.state })
-        ])]),
-        el('td', { class: 'num hint', text: r.attempts ? String(r.attempts) : '—' })
-      ]));
-    });
-
-    n.feed.innerHTML = '';
-    demo.events.forEach((ev) => n.feed.appendChild(feedRow(ev)));
-  }
-
-  /** Smooth countdown, decoupled from the send schedule. */
-  function demoMountTimers() {
-    clearInterval(demo.tick);
-    demo.tick = setInterval(() => {
-      const n = demo.nodes;
-      if (!n || !document.body.contains(n.countdown)) return clearInterval(demo.tick);
-      if (demo.running && demo.nextAt) {
-        n.countdown.textContent = fmtClock(demo.nextAt - Date.now());
-        // Name the gap that was actually drawn, so the randomness is visible
-        // rather than something the user has to take on trust.
-        n.countdownFoot.textContent = 'waiting ' + fmtDuration(demo.pendingGap, true) +
-          ', drawn at random (mostly 5–10s, up to 2m)' + (demo.speed > 1 ? ' (played ×' + demo.speed + ')' : '');
-      } else {
-        n.countdown.textContent = '--:--';
-        n.countdownFoot.textContent = demo.running ? '' : 'paused';
-      }
-    }, 200);
-  }
-
-  // ==========================================================================
   //  VIEW - DASHBOARD
   // ==========================================================================
 
@@ -774,7 +412,6 @@
         el('p', { class: 'lede', style: { marginBottom: '20px' }, text: 'Kech sends through your own mailbox over SMTP. Enter the address and password and it will find the right servers for you.' }),
         el('button', { class: 'btn btn--primary btn--lg', text: 'Set up connection', onclick: () => go('connection') })
       ]));
-      mountSampleCampaign(root);
       return;
     }
 
@@ -861,16 +498,6 @@
           el('button', { class: 'btn btn--primary', text: 'Build a campaign', onclick: () => go('compose') }))
       ])
     ]));
-
-    mountSampleCampaign(root);
-  }
-
-  /** Drops the rehearsal panel in and starts its clocks. */
-  function mountSampleCampaign(root) {
-    if (!demo.recipients.length) demoReset();
-    root.appendChild(demoPanel());
-    demoPaint();
-    demoMountTimers();
   }
 
   /** The pacing window currently in force, stated in plain units. */
@@ -1785,8 +1412,8 @@
   const avgGap = (p) => {
     if (!p.randomize) return Math.max(1, p.minDelayMs);
     const min = p.minDelayMs, max = p.maxDelayMs;
-    const total = DEMO.buckets.reduce((sum, b) => sum + b.weight, 0);
-    const canonMean = DEMO.buckets.reduce((sum, b) => sum + b.weight * ((b.from + b.to) / 2), 0) / total;
+    const total = GAP_BUCKETS.reduce((sum, b) => sum + b.weight, 0);
+    const canonMean = GAP_BUCKETS.reduce((sum, b) => sum + b.weight * ((b.from + b.to) / 2), 0) / total;
     return Math.max(1, min + ((canonMean - 5000) / (120000 - 5000)) * (max - min));
   };
 
@@ -2413,8 +2040,6 @@
 
   function render() {
     unsubscribe();
-    if (demo.running) demoPause();      // the rehearsal only runs while it is on screen
-    demoStop();
     const root = $('#view');
     root.innerHTML = '';
     $$('.nav-item[data-route]').forEach((n) => n.classList.toggle('is-active', n.dataset.route === state.route));

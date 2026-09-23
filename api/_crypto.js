@@ -53,9 +53,17 @@ function verifySession(token) {
   }
 }
 
-/** Constant-time comparison for the dashboard access code. */
+/**
+ * Constant-time comparison for the dashboard access code.
+ *
+ * The built-in default is deliberate and is not a secret: it is published in
+ * this repository, so it gates nothing from anyone who can read the source.
+ * Set ACCESS_CODE in the environment to make the console actually private.
+ */
+const BUILT_IN_CODE = 'kech';
+
 function codeMatches(supplied) {
-  const expected = process.env.ACCESS_CODE || 'kech';
+  const expected = process.env.ACCESS_CODE || BUILT_IN_CODE;
   const a = Buffer.from(String(supplied || ''));
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
