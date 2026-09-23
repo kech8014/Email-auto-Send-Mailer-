@@ -5,3 +5,8 @@ node_modules
 # Order matters: the negation must come after the pattern it exempts.
 .env*
 !.env.example
+
+# Vendored AI-tooling docs dropped in by the Upstash installer; not app code.
+.agents/
+.claude/
+skills-lock.json
