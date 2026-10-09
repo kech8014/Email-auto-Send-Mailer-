@@ -81,16 +81,23 @@ async function controlAction(body) {
     }
 
     case 'resume': {
-      if (meta.status !== 'paused' && meta.status !== 'blocked') {
-        return { status: 400, payload: { error: 'Campaign is not paused' } };
+      if (meta.status !== 'paused' && meta.status !== 'blocked' && meta.status !== 'stopped') {
+        return { status: 400, payload: { error: 'Campaign is not paused or stopped' } };
       }
       if (meta.status === 'blocked') {
         const recheck = conn && conn.health && conn.health.state === 'connected';
         if (!recheck) return { status: 400, payload: { error: 'Re-test the mailbox connection before resuming' } };
       }
+      if (meta.status === 'stopped' && !conn) {
+        return { status: 400, payload: { error: 'Connect a sending mailbox before resuming' } };
+      }
+      // Stop only flips the status; every row keeps its state, so the worker
+      // picks up the remaining queued rows and never re-sends a sent one.
+      const wasStopped = meta.status === 'stopped';
       meta.status = 'running';
+      meta.completedAt = null;
       meta.nextSendAt = Date.now();
-      engine.pushEvent(meta, 'campaign', 'Campaign resumed');
+      engine.pushEvent(meta, 'campaign', wasStopped ? 'Campaign resumed after stop' : 'Campaign resumed', meta.stats.sent + ' already sent');
       await engine.setMeta(meta);
       const kicked = await worker.chain(meta.id);
       return { status: 200, payload: { campaign: publicMeta(meta), worker: kicked } };

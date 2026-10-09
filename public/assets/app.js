@@ -1947,6 +1947,10 @@
         statePill(c.status),
         running ? el('button', { class: 'btn', text: 'Pause', onclick: () => control('pause') }) : null,
         (c.status === 'paused' || c.status === 'blocked') ? el('button', { class: 'btn btn--primary', text: 'Resume', onclick: () => control('resume') }) : null,
+        c.status === 'stopped' ? el('button', { class: 'btn btn--primary', text: 'Resume', onclick: async () => {
+          const left = c.stats.total - c.stats.sent - c.stats.failed - c.stats.skipped;
+          if (await confirmDialog('Resume campaign', 'Sending continues with the ' + fmtNum(left) + ' recipients not yet sent. The ' + fmtNum(c.stats.sent) + ' already sent will not be mailed again.', 'Resume now')) control('resume');
+        } }) : null,
         (running || c.status === 'paused') ? el('button', { class: 'btn btn--danger', text: 'Stop', onclick: async () => {
           if (await confirmDialog('Stop campaign', 'Sending stops immediately. ' + fmtNum(c.stats.sent) + ' messages have already gone out and cannot be recalled.', 'Stop now')) control('stop');
         } }) : null,
