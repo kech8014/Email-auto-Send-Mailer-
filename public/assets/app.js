@@ -977,9 +977,7 @@
               el('span', { text: discovered.provider ? 'via ' + discovered.provider.source : 'unknown' })
             ])
           ]),
-          discovered.provider && discovered.provider.note
-            ? el('p', { class: 'hint', style: { marginTop: '11px', color: 'var(--warn)' }, text: discovered.provider.note })
-            : null
+          null
         ]));
         const fill = (input, value) => { if (!touched.has(input)) input.value = value; };
         const sg = discovered.suggested.smtp;
@@ -1018,6 +1016,36 @@
       return body;
     }
 
+    // Where to fix a rejected sign-in, chosen by the detected provider. Shown only on failure.
+    const HELP_LINKS = {
+      microsoft365: [
+        ['Microsoft 365 admin center (enable Authenticated SMTP)', 'https://admin.microsoft.com/Adminportal/Home#/users'],
+        ['How to enable SMTP AUTH', 'https://aka.ms/smtp_auth_disabled'],
+        ['Microsoft account security (app passwords)', 'https://mysignins.microsoft.com/security-info']
+      ],
+      microsoft: [
+        ['Microsoft account security (app passwords)', 'https://account.live.com/proofs/AppPassword'],
+        ['How to enable SMTP AUTH', 'https://aka.ms/smtp_auth_disabled']
+      ],
+      godaddy: [
+        ['GoDaddy Workspace Email sign-in', 'https://sso.godaddy.com/?app=email'],
+        ['GoDaddy account', 'https://account.godaddy.com/products']
+      ],
+      google: [['Create a Google app password', 'https://myaccount.google.com/apppasswords']]
+    };
+
+    function helpLinks(data) {
+      const id = data.provider && data.provider.id;
+      const links = (id && HELP_LINKS[id]) || [];
+      if (!links.length) return null;
+      return el('div', { style: { marginTop: '14px', padding: '12px 14px', borderRadius: '12px', border: '1px solid rgba(230, 201, 141, 0.25)', background: 'var(--warn-dim)' } }, [
+        el('div', { style: { fontSize: '12.5px', color: 'var(--warn)', marginBottom: '8px' }, text: (data.provider.note || 'Sign in to your provider to fix this:') }),
+        el('div', {}, links.map(([label, href]) => el('div', { style: { marginTop: '4px' } }, [
+          el('a', { href, target: '_blank', rel: 'noopener noreferrer', style: { color: 'var(--warn)', fontSize: '13px' }, text: label + ' ↗' })
+        ])))
+      ]);
+    }
+
     function renderResult(data) {
       resultBox.hidden = false;
       resultBox.innerHTML = '';
@@ -1051,7 +1079,8 @@
         banner,
         el('div', { style: { marginTop: '10px' } }, [
           line('SMTP — outgoing', data.smtp),
-          line('IMAP — incoming', data.imap)
+          // IMAP is optional; once sending works, a missing inbox check is not worth a warning.
+          line('IMAP — incoming', data.smtp.ok && data.imap && !data.imap.ok ? null : data.imap)
         ]),
         !data.smtp.ok && data.attempts && data.attempts.length > 1
           ? el('details', { style: { marginTop: '12px' } }, [
@@ -1059,6 +1088,7 @@
             el('div', { style: { marginTop: '10px' } }, data.attempts.map((a) => el('p', { class: 'hint mono', text: a.service + ' ' + a.host + ':' + a.port + ' — ' + a.message })))
           ])
           : null,
+        !data.smtp.ok ? helpLinks(data) : null,
         !data.smtp.ok ? el('p', { class: 'hint', style: { marginTop: '12px' }, text: 'If your provider uses 2-factor authentication, generate an app-specific password rather than using the account password.' }) : null
       ]));
       saveBtn.disabled = false;

@@ -58,14 +58,21 @@ async function testAction(body) {
 
   let smtpResult = null;
   let smtpConfig = null;
+  let lastSmtp = null;
   for (const candidate of smtpCandidates) {
     const result = await providers.verifySmtp(Object.assign({}, candidate, { user, pass }));
+    lastSmtp = result;
     attempts.push({ service: 'smtp', host: candidate.host, port: candidate.port, ok: result.ok, message: result.message });
     if (result.ok) { smtpResult = result; smtpConfig = candidate; break; }
     // A rejected password will be rejected everywhere; stop probing hosts.
     if (result.auth || /Credentials rejected/i.test(result.message)) { smtpResult = result; break; }
   }
-  if (!smtpResult) smtpResult = { ok: false, message: 'No SMTP server responded on the addresses tried.' };
+  if (!smtpResult) {
+    // With one explicit server the real error is the useful one; a guessed list gets the summary.
+    smtpResult = smtpCandidates.length === 1 && lastSmtp
+      ? lastSmtp
+      : { ok: false, message: 'No SMTP server responded on the addresses tried.' };
+  }
 
   // IMAP is optional: it confirms mailbox access but is not needed to send.
   let imapResult = null;
