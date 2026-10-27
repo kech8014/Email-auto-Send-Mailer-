@@ -170,10 +170,10 @@ async function runTick(campaignId) {
     return { ok: false, error: 'No connection configured' };
   }
 
-  const credentials = engine.smtpCredentials(conn);
-  if (!credentials.pass) {
+  const credentials = await engine.smtpCredentials(conn);
+  if (!credentials.ok) {
     meta.status = 'blocked';
-    engine.pushEvent(meta, 'error', 'Stored credentials could not be decrypted. Reconnect the mailbox.');
+    engine.pushEvent(meta, 'error', credentials.error || 'Stored credentials could not be used. Reconnect the mailbox.');
     await engine.setMeta(meta);
     await store.releaseLock(campaignId, lockToken);
     return { ok: false, error: 'Credential decryption failed' };

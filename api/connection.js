@@ -5,6 +5,7 @@ const store = require('./_store');
 const secrets = require('./_crypto');
 const engine = require('./_engine');
 const providers = require('./_providers');
+const microsoft = require('./_microsoft');
 
 /**
  * Mailbox connection lifecycle: discover, test, save, inspect, disconnect.
@@ -146,9 +147,9 @@ async function recheckAction() {
   const conn = await engine.getConnection();
   if (!conn) return { status: 404, payload: { error: 'No mailbox connected' } };
 
-  const credentials = engine.smtpCredentials(conn);
-  if (!credentials.pass) {
-    conn.health = { state: 'invalid_credentials', checkedAt: Date.now(), message: 'Stored credentials could not be decrypted. Reconnect the mailbox.' };
+  const credentials = await engine.smtpCredentials(conn);
+  if (!credentials.ok) {
+    conn.health = { state: 'invalid_credentials', checkedAt: Date.now(), message: credentials.error || 'Stored credentials could not be used. Reconnect the mailbox.' };
     await store.set('connection', conn);
     return { status: 200, payload: { connection: engine.publicConnection(conn) } };
   }
@@ -176,6 +177,18 @@ module.exports = http.protect(async (req, res) => {
     case 'test':     result = await testAction(body); break;
     case 'save':     result = await saveAction(body); break;
     case 'recheck':  result = await recheckAction(); break;
+    case 'oauth-config':
+      result = { status: 200, payload: { microsoft: microsoft.isConfigured(), redirectUri: microsoft.redirectUri(req) } };
+      break;
+    case 'oauth-start': {
+      if (!microsoft.isConfigured()) {
+        result = { status: 400, payload: { error: 'Microsoft sign-in is not set up yet. Add MS_CLIENT_ID (and MS_CLIENT_SECRET) to the environment - see the README.' } };
+        break;
+      }
+      const email = engine.normalizeEmail(body.email || '');
+      result = { status: 200, payload: { url: microsoft.authorizeUrl(req, { fromName: String(body.fromName || '').trim(), email: engine.isValidEmail(email) ? email : '' }) } };
+      break;
+    }
     case 'get':
       result = { status: 200, payload: { connection: engine.publicConnection(await engine.getConnection()) } };
       break;

@@ -162,6 +162,20 @@ step tells you exactly which of the two failed and why.
 
 ---
 
+### Sign in with Microsoft (OAuth)
+
+Microsoft 365 / Outlook often rejects passwords outright. The Connection page has a
+**Sign in with Microsoft** button that uses OAuth (SMTP/IMAP XOAUTH2) instead.
+
+1. In Microsoft Entra > App registrations, create an app (any org directory and personal accounts).
+2. Add a **Web** redirect URI: `https://YOUR-DOMAIN/api/oauth`.
+3. Delegated permissions: `SMTP.Send`, `IMAP.AccessAsUser.All`, `offline_access`, `openid`, `email`, `profile`.
+4. Create a client secret and set `MS_CLIENT_ID` and `MS_CLIENT_SECRET` (optionally `MS_TENANT`, `MS_REDIRECT_URI`) in Vercel.
+5. For work/school mailboxes, an admin may still need to enable **Authenticated SMTP** for the mailbox
+   (Exchange admin > Mailboxes > Manage email apps) and grant consent to the app.
+
+Only the refresh token is stored, sealed with AES-256-GCM; access tokens are minted per worker tick.
+
 ## API
 
 Every endpoint is `POST` with a JSON body `{ "action": "...", ... }` unless

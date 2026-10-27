@@ -207,7 +207,9 @@ function transportFor(config, extra) {
     host: config.host,
     port: Number(config.port),
     secure: Boolean(config.secure),
-    auth: { user: config.user, pass: config.pass },
+    auth: config.accessToken
+      ? { type: 'OAuth2', user: config.user, accessToken: config.accessToken }
+      : { user: config.user, pass: config.pass },
     connectionTimeout: 12000,
     greetingTimeout: 12000,
     socketTimeout: 25000,

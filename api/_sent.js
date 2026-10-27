@@ -23,7 +23,7 @@ const SENT_NAMES = ['Sent', 'Sent Items', 'Sent Mail', 'INBOX.Sent', '[Gmail]/Se
  * sends anything.
  */
 function createSentSaver(conn, credentials, logger) {
-  const enabled = Boolean(conn && conn.imap && conn.imap.host && credentials && credentials.pass);
+  const enabled = Boolean(conn && conn.imap && conn.imap.host && credentials && (credentials.pass || credentials.accessToken));
   let client = null;
   let mailbox = null;
   let broken = false;
@@ -34,7 +34,9 @@ function createSentSaver(conn, credentials, logger) {
       host: conn.imap.host,
       port: conn.imap.port || 993,
       secure: conn.imap.secure !== false,
-      auth: { user: conn.imap.user || conn.email, pass: credentials.pass },
+      auth: credentials.accessToken
+        ? { user: conn.imap.user || conn.email, accessToken: credentials.accessToken }
+        : { user: conn.imap.user || conn.email, pass: credentials.pass },
       logger: false,
       emitLogs: false
     });

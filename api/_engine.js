@@ -129,6 +129,7 @@ function publicConnection(conn) {
     provider: conn.provider,
     smtp: { host: conn.smtp.host, port: conn.smtp.port, secure: conn.smtp.secure, user: conn.smtp.user },
     imap: conn.imap ? { host: conn.imap.host, port: conn.imap.port, secure: conn.imap.secure, user: conn.imap.user } : null,
+    authType: conn.authType || 'password',
     password: secrets.redact('reference-only'),
     dailyLimit: conn.dailyLimit || null,
     health: conn.health || { state: 'unknown', checkedAt: null, message: null },
@@ -137,15 +138,19 @@ function publicConnection(conn) {
   };
 }
 
-/** Rehydrate live SMTP credentials for the worker only. */
-function smtpCredentials(conn) {
-  return {
-    host: conn.smtp.host,
-    port: conn.smtp.port,
-    secure: conn.smtp.secure,
-    user: conn.smtp.user,
-    pass: secrets.open(conn.smtp.pass)
-  };
+/**
+ * Rehydrate live SMTP credentials for the worker only. Password connections
+ * yield `pass`; Microsoft sign-ins yield a fresh `accessToken` (XOAUTH2).
+ * Either way, `ok` says whether usable credentials were produced.
+ */
+async function smtpCredentials(conn) {
+  const base = { host: conn.smtp.host, port: conn.smtp.port, secure: conn.smtp.secure, user: conn.smtp.user };
+  if (conn.authType === 'microsoft-oauth') {
+    const token = await require('./_microsoft').resolveAccessToken(conn);
+    return Object.assign(base, { accessToken: token.accessToken || null, ok: Boolean(token.accessToken), error: token.error || null });
+  }
+  const pass = secrets.open(conn.smtp.pass);
+  return Object.assign(base, { pass, ok: Boolean(pass), error: pass ? null : 'Stored credentials could not be decrypted. Reconnect the mailbox.' });
 }
 
 // --------------------------------------------------------------- settings ---

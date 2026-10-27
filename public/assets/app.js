@@ -618,6 +618,7 @@
         el('p', { class: 'hint', text: state.connection.provider ? state.connection.provider.label : state.connection.smtp.host }),
         el('hr', { class: 'divider' }),
         infoRow('Domain', state.connection.domain),
+        infoRow('Sign-in', state.connection.authType === 'microsoft-oauth' ? 'Microsoft (OAuth, no password stored)' : 'Password'),
         infoRow('SMTP', state.connection.smtp.host + ':' + state.connection.smtp.port + (state.connection.smtp.secure ? ' · TLS' : ' · STARTTLS')),
         infoRow('IMAP', state.connection.imap ? state.connection.imap.host + ':' + state.connection.imap.port : 'Not configured'),
         infoRow('Daily limit', state.connection.dailyLimit ? fmtNum(state.connection.dailyLimit) + ' messages' : 'Not published by provider'),
@@ -1060,7 +1061,26 @@
       });
     };
 
+    // One-click Microsoft sign-in: no password, works where basic SMTP auth is off.
+    const msBtn = el('button', { class: 'btn btn--lg btn--block', type: 'button', text: 'Sign in with Microsoft' });
+    msBtn.onclick = () => {
+      withBusy(msBtn, 'Opening Microsoft…', async () => {
+        try {
+          const data = await api('connection', { action: 'oauth-start', email: emailInput.value.trim(), fromName: nameInput.value.trim() });
+          window.location.href = data.url;
+          await new Promise(() => {}); // keep the spinner until the browser navigates away
+        } catch (err) { toast(err.message, 'err'); }
+      });
+    };
+    const msBox = el('div', { style: { marginBottom: '22px' } }, [
+      msBtn,
+      el('p', { class: 'hint', style: { marginTop: '8px' }, text: 'Recommended for Outlook, Hotmail and Microsoft 365. You sign in on Microsoft’s own page; no password is entered or stored here.' }),
+      el('hr', { class: 'divider', style: { marginTop: '18px' } }),
+      el('p', { class: 'hint', text: 'Or connect with a password / app password:' })
+    ]);
+
     return el('div', { class: 'card card--pad-lg', style: { maxWidth: '760px' } }, [
+      msBox,
       el('div', { class: 'grid grid--2' }, [
         el('div', { class: 'field' }, [el('label', { class: 'label', text: 'Mailbox address' }), emailInput]),
         el('div', { class: 'field' }, [el('label', { class: 'label', text: 'Password' }), passInput])
@@ -2502,6 +2522,14 @@
       state.activeCampaignId = live.id;
       toast((live.status === 'running' ? 'Campaign in progress' : 'Campaign ' + live.status) + ' — ' + live.name, 'ok', 5000);
       return go('monitor');
+    }
+
+    // Returning from Microsoft sign-in: /?ms=connected#connection or ?ms=error&msg=...
+    const returned = new URLSearchParams(location.search);
+    if (returned.get('ms')) {
+      const ok = returned.get('ms') === 'connected';
+      toast(ok ? 'Signed in with Microsoft. Mailbox connected.' : (returned.get('msg') || 'Microsoft sign-in failed'), ok ? 'ok' : 'err', 8000);
+      history.replaceState(null, '', location.pathname + (ok ? '#dashboard' : '#connection'));
     }
 
     go((location.hash || '#dashboard').slice(1));
