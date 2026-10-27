@@ -90,6 +90,49 @@ const PRESETS = [
     imap: { host: 'imap.fastmail.com', port: 993, secure: true },
     note: 'Fastmail requires an app password scoped to SMTP.',
     dailyLimit: 2000
+  },
+  {
+    id: 'namecheap', label: 'Namecheap Private Email',
+    domains: [], mx: [/privateemail\.com$/i],
+    smtp: { host: 'mail.privateemail.com', port: 465, secure: true },
+    imap: { host: 'mail.privateemail.com', port: 993, secure: true },
+    dailyLimit: 1000
+  },
+  {
+    id: 'titan', label: 'Titan Email',
+    domains: [], mx: [/titan\.email$/i],
+    smtp: { host: 'smtp.titan.email', port: 465, secure: true },
+    imap: { host: 'imap.titan.email', port: 993, secure: true },
+    dailyLimit: 500
+  },
+  {
+    id: 'ionos', label: 'IONOS',
+    domains: [], mx: [/ionos\.(com|de|co\.uk|es|fr)$/i, /1and1\.(com|co\.uk)$/i, /kundenserver\.de$/i],
+    smtp: { host: 'smtp.ionos.com', port: 587, secure: false },
+    imap: { host: 'imap.ionos.com', port: 993, secure: true },
+    dailyLimit: 500
+  },
+  {
+    id: 'rackspace', label: 'Rackspace Email',
+    domains: [], mx: [/emailsrvr\.com$/i],
+    smtp: { host: 'secure.emailsrvr.com', port: 465, secure: true },
+    imap: { host: 'secure.emailsrvr.com', port: 993, secure: true },
+    dailyLimit: 1000
+  },
+  {
+    id: 'aol', label: 'AOL Mail',
+    domains: ['aol.com'], mx: [],
+    smtp: { host: 'smtp.aol.com', port: 465, secure: true },
+    imap: { host: 'imap.aol.com', port: 993, secure: true },
+    note: 'AOL requires a generated app password.',
+    dailyLimit: 500
+  },
+  {
+    id: 'bluehost', label: 'Bluehost / HostGator',
+    domains: [], mx: [/bluehost\.com$/i, /hostgator\.com$/i, /websitewelcome\.com$/i],
+    smtp: { host: 'mail.' + '{domain}', port: 465, secure: true },
+    imap: { host: 'mail.' + '{domain}', port: 993, secure: true },
+    dailyLimit: 500
   }
 ];
 
@@ -111,6 +154,16 @@ async function presetFromMx(domain) {
   } catch (_) {
     return { preset: null, mx: [] };
   }
+}
+
+/** 'mx1.hosting-provider.co.uk' -> 'hosting-provider.co.uk' (good enough without a public-suffix list). */
+function baseDomain(host) {
+  const labels = String(host || '').toLowerCase().replace(/\.$/, '').split('.');
+  if (labels.length <= 2) return labels.join('.');
+  const second = labels[labels.length - 2];
+  const tld = labels[labels.length - 1];
+  const take = tld.length === 2 && ['co', 'com', 'org', 'net', 'gov', 'ac'].includes(second) ? 3 : 2;
+  return labels.slice(-take).join('.');
 }
 
 /** Mozilla's ISPDB covers most hosted-domain providers we have no preset for. */
@@ -181,14 +234,20 @@ async function discover(email) {
       note: preset.note || null,
       source: direct ? 'domain' : 'mx'
     };
-    smtp.push(preset.smtp);
+    const fillHost = (c) => Object.assign({}, c, { host: String(c.host).replace('{domain}', domain) });
+    smtp.push(fillHost(preset.smtp));
     for (const alt of preset.smtpAlt || []) smtp.push(alt);
     // Most providers accept both submission ports; try the other one as a fallback.
-    smtp.push(Object.assign({}, preset.smtp, preset.smtp.port === 465
+    smtp.push(Object.assign({}, fillHost(preset.smtp), preset.smtp.port === 465
       ? { port: 587, secure: false } : { port: 465, secure: true }));
-    imap.push(preset.imap);
+    imap.push(fillHost(preset.imap));
   } else {
-    const auto = await ispdb(domain);
+    // Try the domain itself, then the provider that hosts its mail (from the MX records).
+    let auto = await ispdb(domain);
+    for (const base of [...new Set((mxLookup.mx || []).map(baseDomain))]) {
+      if (auto) break;
+      auto = await ispdb(base);
+    }
     if (auto) {
       provider = { id: 'autoconfig', label: auto.label || domain, note: null, source: 'autoconfig' };
       if (auto.smtp) smtp.push(auto.smtp);
@@ -198,6 +257,13 @@ async function discover(email) {
 
   // A recognised provider has known hosts; guessing smtp.<domain> only slows the test down.
   const conventional = preset ? { smtp: [], imap: [] } : conventionalCandidates(domain);
+  if (!preset) {
+    for (const base of [...new Set((mxLookup.mx || []).map(baseDomain))].filter((b) => b !== domain)) {
+      const extra = conventionalCandidates(base);
+      conventional.smtp.push(...extra.smtp.filter((c) => c.host !== base));
+      conventional.imap.push(...extra.imap.filter((c) => c.host !== base));
+    }
+  }
   const seenSmtp = new Set(smtp.map((c) => c.host + ':' + c.port));
   for (const c of conventional.smtp) {
     const key = c.host + ':' + c.port;

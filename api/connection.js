@@ -52,27 +52,29 @@ async function testAction(body) {
   const discovered = await providers.discover(email);
   const attempts = [];
 
-  const smtpCandidates = body.smtp && body.smtp.host
+  const explicitSmtp = Boolean(body.smtp && body.smtp.host);
+  const smtpCandidates = explicitSmtp
     ? [providers.normalizeEndpoint(body.smtp)]
-    : discovered.smtp.slice(0, 6);
+    : discovered.smtp.slice(0, 10);
 
-  let smtpResult = null;
-  let smtpConfig = null;
-  let lastSmtp = null;
-  for (const candidate of smtpCandidates) {
-    const result = await providers.verifySmtp(Object.assign({}, candidate, { user, pass }));
-    lastSmtp = result;
+  // Probe every candidate at once (guessing hosts one by one would outlast the function limit),
+  // then take the first that signs in, in priority order.
+  const smtpProbes = await Promise.all(smtpCandidates.map(async (candidate) => ({
+    candidate,
+    result: await providers.verifySmtp(Object.assign({}, candidate, { user, pass }))
+  })));
+  for (const { candidate, result } of smtpProbes) {
     attempts.push({ service: 'smtp', host: candidate.host, port: candidate.port, ok: result.ok, message: result.message });
-    if (result.ok) { smtpResult = result; smtpConfig = candidate; break; }
-    // A rejected password will be rejected everywhere; stop probing hosts.
-    if (result.auth || /Credentials rejected/i.test(result.message)) { smtpResult = result; break; }
   }
-  if (!smtpResult) {
-    // With one explicit server the real error is the useful one; a guessed list gets the summary.
-    smtpResult = smtpCandidates.length === 1 && lastSmtp
-      ? lastSmtp
-      : { ok: false, message: 'No SMTP server responded on the addresses tried.' };
-  }
+  const smtpWin = smtpProbes.find((p) => p.result.ok);
+  // A server that answered and refused the login is more useful to report than a dead guess.
+  const smtpAuthFail = smtpProbes.find((p) => p.result.auth);
+  let smtpResult;
+  let smtpConfig = null;
+  if (smtpWin) { smtpResult = smtpWin.result; smtpConfig = smtpWin.candidate; }
+  else if (smtpAuthFail) smtpResult = smtpAuthFail.result;
+  else if (explicitSmtp && smtpProbes[0]) smtpResult = smtpProbes[0].result;
+  else smtpResult = { ok: false, message: 'No SMTP server responded on the addresses tried.' };
 
   // IMAP is optional: it confirms mailbox access but is not needed to send.
   let imapResult = null;
@@ -80,14 +82,17 @@ async function testAction(body) {
   if (body.skipImap !== true) {
     const imapCandidates = body.imap && body.imap.host
       ? [providers.normalizeEndpoint(Object.assign({ secure: true }, body.imap))]
-      : discovered.imap.slice(0, 3);
-    for (const candidate of imapCandidates) {
-      const result = await providers.verifyImap(Object.assign({}, candidate, { user, pass }));
+      : discovered.imap.slice(0, 5);
+    const imapProbes = await Promise.all(imapCandidates.map(async (candidate) => ({
+      candidate,
+      result: await providers.verifyImap(Object.assign({}, candidate, { user, pass, timeout: 8000 }))
+    })));
+    for (const { candidate, result } of imapProbes) {
       attempts.push({ service: 'imap', host: candidate.host, port: candidate.port, ok: result.ok, message: result.message });
-      if (result.ok) { imapResult = result; imapConfig = candidate; break; }
-      if (/rejected|AUTHENTICATIONFAILED/i.test(result.message)) { imapResult = result; break; }
     }
-    if (!imapResult) imapResult = { ok: false, message: 'No IMAP server responded on the addresses tried.' };
+    const imapWin = imapProbes.find((p) => p.result.ok);
+    if (imapWin) { imapResult = imapWin.result; imapConfig = imapWin.candidate; }
+    else imapResult = { ok: false, message: 'No IMAP server responded on the addresses tried.' };
   }
 
   return {
