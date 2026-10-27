@@ -53,7 +53,7 @@ async function testAction(body) {
   const attempts = [];
 
   const smtpCandidates = body.smtp && body.smtp.host
-    ? [{ host: body.smtp.host, port: Number(body.smtp.port), secure: Boolean(body.smtp.secure) }]
+    ? [providers.normalizeEndpoint(body.smtp)]
     : discovered.smtp.slice(0, 6);
 
   let smtpResult = null;
@@ -63,7 +63,7 @@ async function testAction(body) {
     attempts.push({ service: 'smtp', host: candidate.host, port: candidate.port, ok: result.ok, message: result.message });
     if (result.ok) { smtpResult = result; smtpConfig = candidate; break; }
     // A rejected password will be rejected everywhere; stop probing hosts.
-    if (/Credentials rejected/i.test(result.message)) { smtpResult = result; break; }
+    if (result.auth || /Credentials rejected/i.test(result.message)) { smtpResult = result; break; }
   }
   if (!smtpResult) smtpResult = { ok: false, message: 'No SMTP server responded on the addresses tried.' };
 
@@ -72,7 +72,7 @@ async function testAction(body) {
   let imapConfig = null;
   if (body.skipImap !== true) {
     const imapCandidates = body.imap && body.imap.host
-      ? [{ host: body.imap.host, port: Number(body.imap.port), secure: body.imap.secure !== false }]
+      ? [providers.normalizeEndpoint(Object.assign({ secure: true }, body.imap))]
       : discovered.imap.slice(0, 3);
     for (const candidate of imapCandidates) {
       const result = await providers.verifyImap(Object.assign({}, candidate, { user, pass }));

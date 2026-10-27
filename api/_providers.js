@@ -19,9 +19,21 @@ const PRESETS = [
     dailyLimit: 500
   },
   {
+    // Personal Outlook.com / Hotmail addresses.
     id: 'microsoft', label: 'Microsoft 365 / Outlook',
-    domains: ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'], mx: [/outlook\.com$/i, /protection\.outlook\.com$/i],
+    domains: ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'], mx: [],
     smtp: { host: 'smtp-mail.outlook.com', port: 587, secure: false },
+    smtpAlt: [{ host: 'smtp.office365.com', port: 587, secure: false }],
+    imap: { host: 'outlook.office365.com', port: 993, secure: true },
+    note: 'Microsoft often blocks basic SMTP sign-in. If the test is rejected, enable SMTP AUTH or use an app password.',
+    dailyLimit: 300
+  },
+  {
+    // Any custom domain (including GoDaddy-resold mailboxes) whose MX points at Microsoft.
+    id: 'microsoft365', label: 'Microsoft 365 / Outlook',
+    domains: [], mx: [/outlook\.com$/i, /protection\.outlook\.com$/i, /office365\.com$/i],
+    smtp: { host: 'smtp.office365.com', port: 587, secure: false },
+    smtpAlt: [{ host: 'smtp-mail.outlook.com', port: 587, secure: false }],
     imap: { host: 'outlook.office365.com', port: 993, secure: true },
     note: 'Microsoft 365 tenants often disable basic SMTP auth. An admin may need to enable SMTP AUTH for this mailbox.',
     dailyLimit: 10000
@@ -170,6 +182,10 @@ async function discover(email) {
       source: direct ? 'domain' : 'mx'
     };
     smtp.push(preset.smtp);
+    for (const alt of preset.smtpAlt || []) smtp.push(alt);
+    // Most providers accept both submission ports; try the other one as a fallback.
+    smtp.push(Object.assign({}, preset.smtp, preset.smtp.port === 465
+      ? { port: 587, secure: false } : { port: 465, secure: true }));
     imap.push(preset.imap);
   } else {
     const auto = await ispdb(domain);
@@ -180,7 +196,8 @@ async function discover(email) {
     }
   }
 
-  const conventional = conventionalCandidates(domain);
+  // A recognised provider has known hosts; guessing smtp.<domain> only slows the test down.
+  const conventional = preset ? { smtp: [], imap: [] } : conventionalCandidates(domain);
   const seenSmtp = new Set(smtp.map((c) => c.host + ':' + c.port));
   for (const c of conventional.smtp) {
     const key = c.host + ':' + c.port;
@@ -202,6 +219,15 @@ async function discover(email) {
   };
 }
 
+/** Port decides the TLS mode for the standard ports, so a mismatched dropdown can't break the test. */
+function normalizeEndpoint(c) {
+  const port = Number(c.port);
+  let secure = Boolean(c.secure);
+  if (port === 465 || port === 993) secure = true;
+  else if (port === 587 || port === 25 || port === 2525 || port === 143) secure = false;
+  return { host: String(c.host || '').trim(), port, secure };
+}
+
 function transportFor(config, extra) {
   return nodemailer.createTransport(Object.assign({
     host: config.host,
@@ -219,9 +245,11 @@ async function verifySmtp(config) {
   const transport = transportFor(config);
   try {
     await transport.verify();
-    return { ok: true, message: 'SMTP authenticated' };
+    return { ok: true, message: 'Signed in to ' + config.host + ' as ' + config.user };
   } catch (err) {
-    return { ok: false, message: cleanError(err), code: (err && err.code) || null };
+    const raw = String((err && err.response) || (err && err.message) || '');
+    const auth = (err && err.code === 'EAUTH') || /\b53[45]\b|5\.7\.(3|8|139)\b/.test(raw);
+    return { ok: false, auth, message: cleanError(err), code: (err && err.code) || null };
   } finally {
     try { transport.close(); } catch (_) {}
   }
@@ -287,6 +315,9 @@ function verifyImap(config) {
 /** Turn transport noise into something a marketer can actually act on. */
 function cleanError(err) {
   const raw = String((err && err.response) || (err && err.message) || err || 'Unknown error').trim();
+  if (/5\.7\.139|SmtpClientAuthentication|5\.7\.3\b.*Authentication unsuccessful|Authentication unsuccessful/i.test(raw)) {
+    return 'Credentials rejected by Microsoft. Either the password is wrong, or SMTP AUTH is disabled for this mailbox/tenant (an admin can enable "Authenticated SMTP" in the Microsoft 365 admin center), or MFA requires an app password.';
+  }
   if (/EAUTH|\b535\b|\b534\b|Username and Password not accepted|AUTHENTICATIONFAILED/i.test(raw)) {
     return 'Credentials rejected by the server. If the provider enforces 2FA, generate an app-specific password.';
   }
@@ -331,5 +362,6 @@ module.exports = {
   transportFor,
   cleanError,
   classifyFailure,
-  presetForDomain
+  presetForDomain,
+  normalizeEndpoint
 };

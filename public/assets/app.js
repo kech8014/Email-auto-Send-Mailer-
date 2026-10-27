@@ -921,6 +921,20 @@
     const imapHost = el('input', { class: 'input', placeholder: 'imap.yourfirm.com' });
     const imapPort = el('input', { class: 'input num', type: 'number', placeholder: '993' });
 
+    // Fields the user has edited by hand are never overwritten by autodiscovery.
+    const touched = new Set();
+    const secureForPort = (port) => (port === 465 ? 'true' : port === 587 || port === 25 || port === 2525 ? 'false' : null);
+    [smtpHost, smtpPort, smtpSecure, imapHost, imapPort].forEach((input) => {
+      input.addEventListener('input', () => touched.add(input));
+    });
+    smtpPort.addEventListener('input', () => {
+      const secure = secureForPort(Number(smtpPort.value));
+      if (secure) smtpSecure.value = secure;
+    });
+    smtpSecure.addEventListener('change', () => {
+      if (!touched.has(smtpPort) || !smtpPort.value) smtpPort.value = smtpSecure.value === 'true' ? '465' : '587';
+    });
+
     const discoveryBox = el('div', { hidden: true });
     const resultBox = el('div', { hidden: true, style: { marginTop: '18px' } });
 
@@ -967,13 +981,21 @@
             ? el('p', { class: 'hint', style: { marginTop: '11px', color: 'var(--warn)' }, text: discovered.provider.note })
             : null
         ]));
-        if (discovered.suggested.smtp) {
-          smtpHost.placeholder = discovered.suggested.smtp.host;
-          smtpPort.placeholder = String(discovered.suggested.smtp.port);
+        const fill = (input, value) => { if (!touched.has(input)) input.value = value; };
+        const sg = discovered.suggested.smtp;
+        if (sg) {
+          smtpHost.placeholder = sg.host;
+          smtpPort.placeholder = String(sg.port);
+          fill(smtpHost, sg.host);
+          fill(smtpPort, String(sg.port));
+          if (!touched.has(smtpSecure)) smtpSecure.value = sg.secure ? 'true' : 'false';
         }
-        if (discovered.suggested.imap) {
-          imapHost.placeholder = discovered.suggested.imap.host;
-          imapPort.placeholder = String(discovered.suggested.imap.port);
+        const ig = discovered.suggested.imap;
+        if (ig) {
+          imapHost.placeholder = ig.host;
+          imapPort.placeholder = String(ig.port);
+          fill(imapHost, ig.host);
+          fill(imapPort, String(ig.port));
         }
       } catch (_) { discoveryBox.hidden = true; }
     }, 550);
@@ -990,7 +1012,8 @@
         body.smtp = { host: smtpHost.value.trim(), port: Number(smtpPort.value) || 465, secure: smtpSecure.value === 'true' };
       }
       if (manual && imapHost.value.trim()) {
-        body.imap = { host: imapHost.value.trim(), port: Number(imapPort.value) || 993, secure: true };
+        const imapPortNum = Number(imapPort.value) || 993;
+        body.imap = { host: imapHost.value.trim(), port: imapPortNum, secure: imapPortNum !== 143 };
       }
       return body;
     }
@@ -1008,8 +1031,24 @@
           ])
         ]);
       };
+      const banner = data.smtp.ok
+        ? el('div', {
+          role: 'status',
+          style: { display: 'flex', gap: '12px', alignItems: 'center', margin: '12px 0 4px', padding: '14px 16px', borderRadius: '12px', border: '1px solid rgba(134, 227, 189, 0.3)', background: 'var(--ok-dim)', color: 'var(--ok)' }
+        }, [
+          el('span', { style: { fontSize: '20px', lineHeight: '1' }, text: '✓' }),
+          el('div', {}, [
+            el('div', { style: { fontSize: '14px', fontWeight: '600' }, text: 'Connection confirmed' }),
+            el('div', { style: { fontSize: '12.5px', opacity: '0.9', marginTop: '2px' }, text:
+              'Your mailbox is reachable and the password was accepted' +
+              (data.smtp.config ? ' by ' + data.smtp.config.host + ':' + data.smtp.config.port : '') + '. ' +
+              (data.imap && data.imap.ok ? 'Incoming mail (IMAP) works too.' : 'Click “Test and save” to connect it.') })
+          ])
+        ])
+        : null;
       resultBox.appendChild(el('div', { class: 'card' }, [
         el('span', { class: 'label', text: 'Connection test' }),
+        banner,
         el('div', { style: { marginTop: '10px' } }, [
           line('SMTP — outgoing', data.smtp),
           line('IMAP — incoming', data.imap)
@@ -1040,8 +1079,11 @@
     testBtn.onclick = () => {
       if (!emailInput.value.trim() || !passInput.value) return toast('Enter the mailbox address and password', 'warn');
       withBusy(testBtn, 'Testing…', async () => {
-        try { renderResult(await api('connection', Object.assign({ action: 'test' }, payload()))); }
-        catch (err) { toast(err.message, 'err'); }
+        try {
+          const data = await api('connection', Object.assign({ action: 'test' }, payload()));
+          renderResult(data);
+          toast(data.smtp.ok ? 'Connection confirmed — ' + data.smtp.message : data.smtp.message, data.smtp.ok ? 'ok' : 'err');
+        } catch (err) { toast(err.message, 'err'); }
       });
     };
 
