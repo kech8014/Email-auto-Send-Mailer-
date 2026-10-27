@@ -128,7 +128,10 @@
       </button>
       <span class="label" id="topbar-title">Dashboard</span>
       <span class="spacer"></span>
-      <span class="pill" id="conn-pill" hidden><span class="dot"></span><span class="txt">Not connected</span></span>
+      <div class="mbx" id="mbx">
+        <button class="pill mbx-btn" id="conn-pill" type="button" aria-haspopup="listbox" aria-expanded="false" hidden><span class="dot"></span><span class="txt">Not connected</span><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3.5l3 3 3-3" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="mbx-menu" id="mbx-menu" role="listbox" hidden></div>
+      </div>
       <button class="btn btn--sm" id="btn-recheck" hidden>Re-test</button>
     </header>
 

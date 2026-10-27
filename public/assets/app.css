@@ -574,3 +574,19 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 @media (max-width: 900px) { .nav-toggle { display: inline-flex; } }
 
 [hidden] { display: none !important; }
+
+/* Mailbox switcher */
+.mbx { position: relative; }
+.mbx-btn { cursor: pointer; font: inherit; }
+.mbx-btn .txt { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mbx-menu { position: absolute; right: 0; top: calc(100% + 8px); z-index: 50; min-width: 280px; max-width: 92vw; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5); }
+.mbx-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.mbx-item:hover { background: rgba(255, 255, 255, 0.05); }
+.mbx-item .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.mbx-item[data-state="connected"] .dot { background: var(--ok); }
+.mbx-item[data-state="invalid_credentials"] .dot, .mbx-item[data-state="error"] .dot { background: var(--err); }
+.mbx-item[data-state="unavailable"] .dot { background: var(--warn); }
+.mbx-item .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mbx-item .sub { display: block; font-size: 11px; color: var(--muted); }
+.mbx-item .tick { color: var(--ok); font-size: 12px; }
+.mbx-sep { height: 1px; margin: 6px 4px; background: var(--line); }

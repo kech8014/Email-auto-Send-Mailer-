@@ -13,6 +13,55 @@ const providers = require('./_providers');
  * credential.
  */
 
+/**
+ * Saved mailboxes. `connection` stays the single active record the worker
+ * reads; `mailboxes` is the list of everything the user has connected, so
+ * switching sender is a lookup rather than a re-entry of credentials.
+ */
+async function loadMailboxes() {
+  const list = (await store.get('mailboxes')) || [];
+  const active = await engine.getConnection();
+  if (active && !list.some((m) => m.email === active.email)) list.push(active); // pre-dropdown installs
+  return list;
+}
+
+async function mailboxList() {
+  const list = await loadMailboxes();
+  const active = await engine.getConnection();
+  return {
+    activeEmail: active ? active.email : null,
+    mailboxes: list.map(engine.publicConnection)
+  };
+}
+
+async function upsertMailbox(conn) {
+  const list = (await loadMailboxes()).filter((m) => m.email !== conn.email);
+  list.push(conn);
+  await store.set('mailboxes', list);
+  await store.set('connection', conn);
+}
+
+/** Make a saved mailbox the active sender and confirm it still authenticates. */
+async function selectAction(body) {
+  const email = engine.normalizeEmail(body.email);
+  const conn = (await loadMailboxes()).find((m) => m.email === email);
+  if (!conn) return { status: 404, payload: { error: 'That mailbox is not saved' } };
+  await store.set('connection', conn);
+  return recheckAction(); // verifies, records health, and returns the refreshed list
+}
+
+async function removeAction(body) {
+  const email = engine.normalizeEmail(body.email || ((await engine.getConnection()) || {}).email);
+  const rest = (await loadMailboxes()).filter((m) => m.email !== email);
+  await store.set('mailboxes', rest);
+  const active = await engine.getConnection();
+  if (active && active.email === email) {
+    if (rest.length) await store.set('connection', rest[0]);
+    else await store.del('connection');
+  }
+  return { status: 200, payload: Object.assign({ ok: true }, await mailboxList()) };
+}
+
 async function discoverAction(body) {
   const email = engine.normalizeEmail(body.email);
   if (!engine.isValidEmail(email)) {
@@ -62,8 +111,8 @@ async function testAction(body) {
     const result = await providers.verifySmtp(Object.assign({}, candidate, { user, pass }));
     attempts.push({ service: 'smtp', host: candidate.host, port: candidate.port, ok: result.ok, message: result.message });
     if (result.ok) { smtpResult = result; smtpConfig = candidate; break; }
-    // A rejected password will be rejected everywhere; stop probing hosts.
-    if (/Credentials rejected/i.test(result.message)) { smtpResult = result; break; }
+    // A rejected login will be rejected everywhere; stop probing hosts.
+    if (result.auth) { smtpResult = result; break; }
   }
   if (!smtpResult) smtpResult = { ok: false, message: 'No SMTP server responded on the addresses tried.' };
 
@@ -137,8 +186,8 @@ async function saveAction(body) {
     createdAt: Date.now()
   };
 
-  await store.set('connection', connection);
-  return { status: 200, payload: { ok: true, connection: engine.publicConnection(connection) } };
+  await upsertMailbox(connection);
+  return { status: 200, payload: Object.assign({ ok: true, connection: engine.publicConnection(connection) }, await mailboxList()) };
 }
 
 /** Re-check a stored connection without asking for the password again. */
@@ -149,21 +198,21 @@ async function recheckAction() {
   const credentials = engine.smtpCredentials(conn);
   if (!credentials.pass) {
     conn.health = { state: 'invalid_credentials', checkedAt: Date.now(), message: 'Stored credentials could not be decrypted. Reconnect the mailbox.' };
-    await store.set('connection', conn);
+    await upsertMailbox(conn);
     return { status: 200, payload: { connection: engine.publicConnection(conn) } };
   }
 
   const result = await providers.verifySmtp(credentials);
   let state = 'connected';
   if (!result.ok) {
-    if (/Credentials rejected/i.test(result.message)) state = 'invalid_credentials';
+    if (result.auth) state = 'invalid_credentials';
     else if (/timed out|refused|resolved/i.test(result.message)) state = 'unavailable';
     else state = 'error';
   }
   conn.health = { state, checkedAt: Date.now(), message: result.message };
   if (result.ok) conn.verifiedAt = Date.now();
-  await store.set('connection', conn);
-  return { status: 200, payload: { connection: engine.publicConnection(conn) } };
+  await upsertMailbox(conn);
+  return { status: 200, payload: Object.assign({ connection: engine.publicConnection(conn) }, await mailboxList()) };
 }
 
 module.exports = http.protect(async (req, res) => {
@@ -177,21 +226,23 @@ module.exports = http.protect(async (req, res) => {
     case 'save':     result = await saveAction(body); break;
     case 'recheck':  result = await recheckAction(); break;
     case 'get':
-      result = { status: 200, payload: { connection: engine.publicConnection(await engine.getConnection()) } };
+      result = { status: 200, payload: Object.assign({ connection: engine.publicConnection(await engine.getConnection()) }, await mailboxList()) };
       break;
+    case 'list':   result = { status: 200, payload: await mailboxList() }; break;
+    case 'select': result = await selectAction(body); break;
+    case 'remove': result = await removeAction(body); break;
     // The display name recipients see. Changing it is not a credential change,
     // so it must not require re-entering the password or re-testing the server.
     case 'set-name': {
       const conn = await engine.getConnection();
       if (!conn) { result = { status: 404, payload: { error: 'No mailbox connected' } }; break; }
       conn.fromName = String(body.fromName || '').trim().slice(0, 120) || null;
-      await store.set('connection', conn);
-      result = { status: 200, payload: { connection: engine.publicConnection(conn) } };
+      await upsertMailbox(conn);
+      result = { status: 200, payload: Object.assign({ connection: engine.publicConnection(conn) }, await mailboxList()) };
       break;
     }
     case 'disconnect':
-      await store.del('connection');
-      result = { status: 200, payload: { ok: true } };
+      result = await removeAction({});
       break;
     case 'providers':
       result = { status: 200, payload: { presets: providers.PRESETS.map((p) => ({ id: p.id, label: p.label, smtp: p.smtp, imap: p.imap, note: p.note || null })) } };

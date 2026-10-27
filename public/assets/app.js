@@ -208,6 +208,7 @@
   const state = {
     route: 'dashboard',
     connection: null,
+    mailboxes: [],
     settings: null,
     campaigns: [],
     analytics: null,
@@ -528,7 +529,62 @@
     ]);
   }
 
+  /** Adopt the mailbox list the server returns with every connection call. */
+  function adoptMailboxes(data) {
+    if (!data) return;
+    if (data.mailboxes) state.mailboxes = data.mailboxes;
+    if (data.connection !== undefined) state.connection = data.connection;
+    else if (data.activeEmail !== undefined) state.connection = state.mailboxes.find((m) => m.email === data.activeEmail) || null;
+  }
+
+  async function switchMailbox(email) {
+    closeMailboxMenu();
+    if (state.connection && state.connection.email === email) return;
+    const dismiss = toast('Connecting ' + email + '…', 'info', 30000);
+    try {
+      const data = await api('connection', { action: 'select', email });
+      adoptMailboxes(data);
+      dismiss();
+      const ok = state.connection.health.state === 'connected';
+      toast(ok ? 'Now sending from ' + email : state.connection.health.message, ok ? 'ok' : 'err');
+    } catch (err) {
+      dismiss();
+      toast(err.message, 'err');
+    }
+    updateChrome();
+    if (['connection', 'dashboard', 'compose'].includes(state.route)) render();
+  }
+
+  function closeMailboxMenu() {
+    $('#mbx-menu').hidden = true;
+    $('#conn-pill').setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleMailboxMenu() {
+    const menu = $('#mbx-menu');
+    if (!menu.hidden) return closeMailboxMenu();
+    menu.innerHTML = '';
+    const active = state.connection && state.connection.email;
+    state.mailboxes.forEach((m) => {
+      menu.appendChild(el('button', { class: 'mbx-item', type: 'button', role: 'option', 'data-state': (m.health && m.health.state) || 'unknown', onclick: () => switchMailbox(m.email) }, [
+        el('span', { class: 'dot' }),
+        el('span', { class: 'who' }, [
+          document.createTextNode(m.email),
+          el('span', { class: 'sub', text: m.fromName || (m.provider && m.provider.label) || m.smtp.host })
+        ]),
+        m.email === active ? el('span', { class: 'tick', text: '✓' }) : null
+      ]));
+    });
+    if (state.mailboxes.length) menu.appendChild(el('div', { class: 'mbx-sep' }));
+    menu.appendChild(el('button', { class: 'mbx-item', type: 'button', onclick: () => { closeMailboxMenu(); state.addingMailbox = true; go('connection'); render(); } }, [
+      el('span', { class: 'who', text: '+ Add another mailbox' })
+    ]));
+    menu.hidden = false;
+    $('#conn-pill').setAttribute('aria-expanded', 'true');
+  }
+
   function connectionPill(conn) {
+    if (!conn && state.mailboxes.length) return { cls: 'pill--warn', text: 'Select a mailbox' };
     if (!conn) return { cls: 'pill--err', text: 'No mailbox' };
     const state = conn.health ? conn.health.state : 'unknown';
     if (state === 'connected') return { cls: 'pill--ok', text: conn.email };
@@ -763,9 +819,11 @@
 
     if (state.connection) {
       root.appendChild(connectedPanel());
+      const adding = state.addingMailbox;
+      state.addingMailbox = false;
       root.appendChild(el('div', { style: { marginTop: '22px' } }, [
-        el('details', {}, [
-          el('summary', { class: 'label', style: { cursor: 'pointer', padding: '8px 0' }, text: 'Replace this connection' }),
+        el('details', adding ? { open: '' } : {}, [
+          el('summary', { class: 'label', style: { cursor: 'pointer', padding: '8px 0' }, text: 'Add another mailbox' }),
           el('div', { style: { marginTop: '14px' } }, [connectionForm()])
         ])
       ]));
@@ -801,7 +859,7 @@
       save.textContent = 'Saving…';
       try {
         const data = await api('connection', { action: 'set-name', fromName: input.value });
-        state.connection = data.connection;
+        adoptMailboxes(data);
         updateChrome();
         toast('Sender name updated', 'ok');
         paint();
@@ -867,11 +925,11 @@
         el('div', { class: 'row row--wrap' }, [
           el('button', { class: 'btn', text: 'Re-test connection', onclick: recheckConnection }),
           el('button', {
-            class: 'btn btn--danger', text: 'Disconnect', onclick: async () => {
-              if (!(await confirmDialog('Disconnect mailbox', 'Running campaigns will stop until a mailbox is connected again. The stored password will be deleted.', 'Disconnect'))) return;
-              await api('connection', { action: 'disconnect' });
-              state.connection = null;
-              toast('Mailbox disconnected', 'warn');
+            class: 'btn btn--danger', text: 'Remove mailbox', onclick: async () => {
+              if (!(await confirmDialog('Remove mailbox', 'The stored password for ' + conn.email + ' will be deleted. If other mailboxes are saved, the next one becomes active.', 'Remove'))) return;
+              adoptMailboxes(await api('connection', { action: 'remove', email: conn.email }));
+              toast('Mailbox removed', 'warn');
+              updateChrome();
               render();
             }
           })
@@ -1049,7 +1107,7 @@
       withBusy(saveBtn, 'Saving…', async () => {
         try {
           const data = await api('connection', Object.assign({ action: 'save' }, payload()));
-          state.connection = data.connection;
+          adoptMailboxes(data);
           passInput.value = '';
           toast('Mailbox connected and verified', 'ok');
           go('dashboard');
@@ -1088,7 +1146,7 @@
     const dismiss = toast('Re-testing connection…', 'info', 30000);
     try {
       const data = await api('connection', { action: 'recheck' });
-      state.connection = data.connection;
+      adoptMailboxes(data);
       dismiss();
       const ok = data.connection.health.state === 'connected';
       toast(ok ? 'Connection healthy' : data.connection.health.message, ok ? 'ok' : 'err');
@@ -2484,7 +2542,7 @@
         api('settings', { action: 'get' }),
         api('campaign', { action: 'list' })
       ]);
-      state.connection = conn.connection;
+      adoptMailboxes(conn);
       state.settings = settings.settings;
       state.campaigns = list.campaigns;
     } catch (err) {
@@ -2533,11 +2591,14 @@
   $('#sign-out').addEventListener('click', async () => {
     await api('auth', { action: 'logout' }).catch(() => {});
     state.connection = null;
+    state.mailboxes = [];
     state.campaigns = [];
     showGate('Signed out.');
   });
 
   $('#btn-recheck').addEventListener('click', recheckConnection);
+  $('#conn-pill').addEventListener('click', (e) => { e.stopPropagation(); if (state.mailboxes.length || state.connection) toggleMailboxMenu(); else go('connection'); });
+  document.addEventListener('click', (e) => { if (!e.target.closest('#mbx')) closeMailboxMenu(); });
 
   $('#nav-toggle').addEventListener('click', () => {
     const nav = $('#nav');

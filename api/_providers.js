@@ -20,11 +20,19 @@ const PRESETS = [
   },
   {
     id: 'microsoft', label: 'Microsoft 365 / Outlook',
-    domains: ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'], mx: [/outlook\.com$/i, /protection\.outlook\.com$/i],
-    smtp: { host: 'smtp-mail.outlook.com', port: 587, secure: false },
+    domains: [], mx: [/outlook\.com$/i, /protection\.outlook\.com$/i, /office365\.com$/i, /microsoft\.com$/i],
+    smtp: { host: 'smtp.office365.com', port: 587, secure: false },
     imap: { host: 'outlook.office365.com', port: 993, secure: true },
     note: 'Microsoft 365 tenants often disable basic SMTP auth. An admin may need to enable SMTP AUTH for this mailbox.',
     dailyLimit: 10000
+  },
+  {
+    id: 'outlook-personal', label: 'Outlook.com / Hotmail',
+    domains: ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'], mx: [],
+    smtp: { host: 'smtp-mail.outlook.com', port: 587, secure: false },
+    imap: { host: 'outlook.office365.com', port: 993, secure: true },
+    note: 'Outlook.com requires an app password when two-step verification is on.',
+    dailyLimit: 300
   },
   {
     id: 'zoho', label: 'Zoho Mail',
@@ -211,6 +219,8 @@ function transportFor(config, extra) {
     connectionTimeout: 12000,
     greetingTimeout: 12000,
     socketTimeout: 25000,
+    // Never fall back to plaintext on a STARTTLS port (loopback is the dev sink).
+    requireTLS: !config.secure && !/^(127\.|localhost$)/.test(String(config.host)),
     tls: { minVersion: 'TLSv1.2', servername: config.host }
   }, extra || {}));
 }
@@ -221,7 +231,7 @@ async function verifySmtp(config) {
     await transport.verify();
     return { ok: true, message: 'SMTP authenticated' };
   } catch (err) {
-    return { ok: false, message: cleanError(err), code: (err && err.code) || null };
+    return { ok: false, message: cleanError(err), code: (err && err.code) || null, auth: isAuthError(err) };
   } finally {
     try { transport.close(); } catch (_) {}
   }
@@ -284,9 +294,17 @@ function verifyImap(config) {
   });
 }
 
+function isAuthError(err) {
+  const raw = String((err && err.response) || (err && err.message) || err || '');
+  return (err && err.code === 'EAUTH') || /\b53[45]\b|AUTHENTICATIONFAILED|Username and Password not accepted/i.test(raw);
+}
+
 /** Turn transport noise into something a marketer can actually act on. */
 function cleanError(err) {
   const raw = String((err && err.response) || (err && err.message) || err || 'Unknown error').trim();
+  if (/SmtpClientAuthentication|5\.7\.139|5\.7\.57|basic authentication is disabled|security defaults/i.test(raw)) {
+    return 'Microsoft 365 is blocking SMTP sign-in for this mailbox (SMTP AUTH / basic auth is disabled). In the Microsoft 365 admin centre open Users > Active users > this mailbox > Mail > Manage email apps and tick "Authenticated SMTP", and make sure Security Defaults is not blocking it. If MFA is on, use an app password.';
+  }
   if (/EAUTH|\b535\b|\b534\b|Username and Password not accepted|AUTHENTICATIONFAILED/i.test(raw)) {
     return 'Credentials rejected by the server. If the provider enforces 2FA, generate an app-specific password.';
   }
