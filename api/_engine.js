@@ -115,8 +115,134 @@ function pushEvent(meta, type, message, detail) {
 
 // -------------------------------------------------------------- connection --
 
-async function getConnection() {
-  return store.get(CONNECTION_KEY);
+/**
+ * Mailboxes.
+ *
+ * A person can connect several sending mailboxes (up to MAX_MAILBOXES) and pick
+ * which one each campaign sends from, so campaigns on different mailboxes run
+ * side by side without sharing a sending limit.
+ *
+ * The first mailbox - the one that existed before this feature - is "main" and
+ * keeps its original storage key, so nothing moves. Additional mailboxes live
+ * under their own keys, with a small index so they can be listed.
+ */
+const MAIN_ACCOUNT = 'main';
+const MAX_MAILBOXES = 5;
+const accountKey = (ws, accountId) =>
+  !accountId || accountId === MAIN_ACCOUNT
+    ? store.nsKey(ws, CONNECTION_KEY)
+    : store.nsKey(ws, 'connection/' + accountId);
+const accountIndexKey = (ws) => store.nsKey(ws, 'connections/index');
+
+async function getConnection(ws, accountId) {
+  return store.get(accountKey(ws, accountId));
+}
+
+async function setConnection(conn, ws, accountId) {
+  const id = accountId || MAIN_ACCOUNT;
+  await store.set(accountKey(ws, id), conn);
+  if (id !== MAIN_ACCOUNT) {
+    const ids = (await store.get(accountIndexKey(ws))) || [];
+    if (!ids.includes(id)) await store.set(accountIndexKey(ws), [...ids, id]);
+  }
+}
+
+async function clearConnection(ws, accountId) {
+  const id = accountId || MAIN_ACCOUNT;
+  await store.del(accountKey(ws, id));
+  if (id !== MAIN_ACCOUNT) {
+    const ids = (await store.get(accountIndexKey(ws))) || [];
+    await store.set(accountIndexKey(ws), ids.filter((x) => x !== id));
+  }
+}
+
+/** Every connected mailbox for a person: [{ id, conn }], main first. */
+async function listConnections(ws) {
+  const out = [];
+  const main = await getConnection(ws, MAIN_ACCOUNT);
+  if (main) out.push({ id: MAIN_ACCOUNT, conn: main });
+  for (const id of (await store.get(accountIndexKey(ws))) || []) {
+    const conn = await getConnection(ws, id);
+    if (conn) out.push({ id, conn });
+  }
+  return out;
+}
+
+/** The mailbox a campaign sends through. Campaigns made before this feature use "main". */
+function accountOf(meta) {
+  return (meta && meta.accountId) || MAIN_ACCOUNT;
+}
+
+function newAccountId() {
+  return 'm_' + crypto.randomBytes(4).toString('hex');
+}
+
+/**
+ * Which connected mailbox will this campaign really send through?
+ *
+ * A campaign is tied to the mailbox ADDRESS it was created for. That matters for
+ * campaigns made before mailboxes could be chosen: they carry no mailbox id, and
+ * the console used to hold just one mailbox that people swapped between, so such
+ * a campaign may have been created for an address that is not the "main" one
+ * today. Sending it through whatever is connected would put one person's
+ * message in another person's name. So:
+ *
+ *   - a campaign with a mailbox id uses that mailbox;
+ *   - an older campaign uses the connected mailbox with the address it was
+ *     created for;
+ *   - and in every case, if the mailbox found does not have the address the
+ *     campaign was created for, it is refused (nothing is sent) and the reason
+ *     is returned.
+ */
+function pickAccount(meta, all) {
+  const sender = meta.sender && meta.sender.email ? String(meta.sender.email).toLowerCase() : null;
+  const same = (m) => String(m.conn.email).toLowerCase() === sender;
+  let pick = null;
+  if (meta.accountId) pick = all.find((m) => m.id === meta.accountId) || null;
+  else if (sender) pick = all.find(same) || null;
+  else pick = all.find((m) => m.id === MAIN_ACCOUNT) || null;
+
+  if (!pick) return { id: meta.accountId || MAIN_ACCOUNT, conn: null, reason: 'missing', expected: sender };
+  if (sender && !same(pick)) {
+    return { id: pick.id, conn: null, reason: 'mismatch', expected: sender, actual: pick.conn.email };
+  }
+  return { id: pick.id, conn: pick.conn };
+}
+
+async function resolveAccount(meta) {
+  return pickAccount(meta, await listConnections(wsOf(meta)));
+}
+
+/** A sentence for a campaign that cannot find its mailbox. */
+function accountProblem(resolved) {
+  if (resolved.reason === 'mismatch') {
+    return 'This campaign was created to send from ' + resolved.expected + ', but that mailbox is not the one connected here (' + resolved.actual + '). Nothing was sent.';
+  }
+  return 'This campaign was created to send from ' + (resolved.expected || 'a mailbox') + ', which is not connected. Connect it again to continue. Nothing was sent.';
+}
+
+/**
+ * Is another campaign already sending through the same mailbox?
+ * Two campaigns sharing one mailbox share its provider limits, which is exactly
+ * how a mailbox gets suspended - so refuse it and say why.
+ */
+async function mailboxBusy(meta) {
+  const ws = wsOf(meta);
+  const all = await listConnections(ws);
+  const account = pickAccount(meta, all).id;
+  for (const id of await store.listCampaignIds(ws)) {
+    if (id === meta.id) continue;
+    const other = await getMeta(id);
+    if (other && other.status === 'running' && pickAccount(other, all).id === account) {
+      return { id: other.id, name: other.name };
+    }
+  }
+  return null;
+}
+
+/** The workspace a campaign belongs to. Campaigns made before multi-user are the owner's. */
+function wsOf(meta) {
+  return (meta && meta.ws) || store.DEFAULT_WS;
 }
 
 /** Public view of the connection. Secrets never leave the server. */
@@ -150,8 +276,8 @@ function smtpCredentials(conn) {
 
 // --------------------------------------------------------------- settings ---
 
-async function getSettings() {
-  const saved = (await store.get(SETTINGS_KEY)) || {};
+async function getSettings(ws) {
+  const saved = (await store.get(store.nsKey(ws, SETTINGS_KEY))) || {};
   return Object.assign({
     pacing: Object.assign({}, DEFAULT_PACING),
     retry: Object.assign({}, DEFAULT_RETRY),
@@ -163,27 +289,27 @@ async function getSettings() {
   }, saved);
 }
 
-async function saveSettings(patch) {
-  const current = await getSettings();
+async function saveSettings(patch, ws) {
+  const current = await getSettings(ws);
   const next = Object.assign({}, current, patch, {
     pacing: Object.assign({}, current.pacing, patch.pacing || {}),
     retry: Object.assign({}, current.retry, patch.retry || {})
   });
-  await store.set(SETTINGS_KEY, next);
+  await store.set(store.nsKey(ws, SETTINGS_KEY), next);
   return next;
 }
 
 // ------------------------------------------------------------ suppression ---
 
-async function getSuppression() {
-  return (await store.get(SUPPRESSION_KEY)) || [];
+async function getSuppression(ws) {
+  return (await store.get(store.nsKey(ws, SUPPRESSION_KEY))) || [];
 }
 
-async function addSuppression(emails) {
-  const set = new Set((await getSuppression()).map((e) => e.toLowerCase()));
+async function addSuppression(emails, ws) {
+  const set = new Set((await getSuppression(ws)).map((e) => e.toLowerCase()));
   for (const e of emails) set.add(String(e).toLowerCase());
   const list = [...set];
-  await store.set(SUPPRESSION_KEY, list);
+  await store.set(store.nsKey(ws, SUPPRESSION_KEY), list);
   return list;
 }
 
@@ -460,11 +586,12 @@ function capStatus(meta, now) {
 // ------------------------------------------------------------ campaign CRUD --
 
 async function createCampaign(input) {
-  const settings = await getSettings();
+  const ws = input.ws || store.DEFAULT_WS;
+  const settings = await getSettings(ws);
   const id = 'cmp_' + crypto.randomBytes(8).toString('hex');
   const now = Date.now();
 
-  const suppression = await getSuppression();
+  const suppression = await getSuppression(ws);
   const { prepared, issues } = prepareRecipients(input.rows || [], input.emailField, suppression);
 
   // Write recipients out in chunks so the worker only rewrites what it touches.
@@ -474,6 +601,9 @@ async function createCampaign(input) {
 
   const meta = {
     id,
+    ws,
+    accountId: input.accountId || MAIN_ACCOUNT,
+    owner: input.ownerName || null,
     name: input.name || 'Untitled campaign',
     status: 'ready',
     createdAt: now,
@@ -524,17 +654,27 @@ async function createCampaign(input) {
   }
 
   await setMeta(meta);
-  await store.indexCampaign(id);
+  await store.indexCampaign(id, ws);
   return meta;
 }
 
-async function listCampaigns() {
-  const ids = await store.listCampaignIds();
+async function listCampaigns(ws) {
+  const ids = await store.listCampaignIds(ws);
+  const all = await listConnections(ws);
   const out = [];
   for (const id of ids) {
     const meta = await getMeta(id);
     if (!meta) continue;
+    const picked = pickAccount(meta, all);
     out.push({
+      // Which mailbox this campaign sends from, worked out the same way the
+      // sender does it, so the screen and the worker can never disagree.
+      mailbox: {
+        id: picked.id,
+        email: picked.conn ? picked.conn.email : (meta.sender && meta.sender.email) || null,
+        connected: Boolean(picked.conn),
+        problem: picked.conn ? null : accountProblem(picked)
+      },
       id: meta.id,
       name: meta.name,
       status: meta.status,
@@ -545,10 +685,57 @@ async function listCampaigns() {
       sender: meta.sender,
       stats: meta.stats,
       attachments: (meta.attachments || []).length,
-      pacing: meta.pacing
+      pacing: meta.pacing,
+      // Recent sending, so a mailbox's real load is visible at a glance.
+      sentLastHour: (meta.sendLog || []).filter((t) => Date.now() - t < 3600000).length,
+      sentLast24h: (meta.sendLog || []).filter((t) => Date.now() - t < 86400000).length,
+      nextSendAt: meta.nextSendAt || null
     });
   }
   return out;
+}
+
+/**
+ * Campaigns that are saved but missing from their list.
+ *
+ * A campaign's data and the list that shows it are stored separately. If the list
+ * ever loses an entry the campaign still exists but cannot be seen. This scans
+ * everything that is actually stored, and reports the ones no list mentions.
+ */
+async function findUnlistedCampaigns() {
+  const keys = await store.scanKeys('campaigns/cmp_');
+  if (!keys) return { supported: false, scanned: 0, unlisted: [] };
+
+  const ids = keys.filter((k) => /^campaigns\/cmp_[0-9a-f]+$/.test(k)).map((k) => k.slice('campaigns/'.length));
+  const listed = new Map();
+  const unlisted = [];
+  for (const id of ids) {
+    const meta = await getMeta(id);
+    if (!meta) continue;
+    const ws = wsOf(meta);
+    if (!listed.has(ws)) listed.set(ws, new Set(await store.listCampaignIds(ws)));
+    if (listed.get(ws).has(id)) continue;
+    unlisted.push({
+      id, ws,
+      name: meta.name,
+      status: meta.status,
+      mailbox: meta.sender && meta.sender.email,
+      createdAt: meta.createdAt,
+      sent: meta.stats && meta.stats.sent,
+      total: meta.stats && meta.stats.total
+    });
+  }
+  return { supported: true, scanned: ids.length, unlisted };
+}
+
+/** Put unlisted campaigns back into the list of the workspace they belong to. */
+async function restoreCampaigns(unlisted) {
+  let restored = 0;
+  for (const c of unlisted) {
+    await store.indexCampaign(c.id, c.ws);
+    restored += 1;
+  }
+  return restored;
 }
 
 // ------------------------------------------------------------- preflight ----
@@ -685,6 +872,19 @@ module.exports = {
   updateRecipient,
   pushEvent,
   getConnection,
+  setConnection,
+  clearConnection,
+  listConnections,
+  findUnlistedCampaigns,
+  restoreCampaigns,
+  accountOf,
+  resolveAccount,
+  accountProblem,
+  newAccountId,
+  mailboxBusy,
+  MAIN_ACCOUNT,
+  MAX_MAILBOXES,
+  wsOf,
   publicConnection,
   smtpCredentials,
   getSettings,

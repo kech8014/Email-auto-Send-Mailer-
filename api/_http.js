@@ -78,6 +78,12 @@ function protect(handler, options) {
     if (!opts.public) {
       session = sessionFrom(req);
       if (!session) return json(res, 401, { error: 'Session expired or missing', code: 'unauthenticated' });
+      // Removing a person takes effect on their very next request.
+      if (session.ws && session.ws !== 'default') {
+        let active = true;
+        try { active = await require('./_users').isActive(session.ws); } catch (_) { active = true; }
+        if (!active) return json(res, 401, { error: 'Session expired or missing', code: 'unauthenticated' });
+      }
     }
 
     try {

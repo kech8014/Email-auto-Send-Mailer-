@@ -33,8 +33,25 @@ function open(sealed) {
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 
-function issueSession() {
-  const payload = Buffer.from(JSON.stringify({ iat: Date.now(), exp: Date.now() + SESSION_TTL_MS, n: crypto.randomUUID() })).toString('base64url');
+/**
+ * A session says who signed in. `ws` is the workspace they work in, `name` is
+ * shown in the console, and `admin` is true only for the owner (the original
+ * ACCESS_CODE), who is the one who can add or remove other people.
+ *
+ * Sessions issued before multi-user existed carry none of these fields; they are
+ * read as the owner, which is exactly who they were, so nobody is signed out.
+ */
+function issueSession(user) {
+  const u = user || {};
+  const claims = {
+    iat: Date.now(),
+    exp: Date.now() + SESSION_TTL_MS,
+    n: crypto.randomUUID(),
+    ws: u.ws || 'default',
+    name: u.name || 'Owner',
+    admin: u.admin !== false
+  };
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
   const sig = crypto.createHmac('sha256', keyMaterial()).update(payload).digest('base64url');
   return `${payload}.${sig}`;
 }
@@ -47,7 +64,10 @@ function verifySession(token) {
   if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
   try {
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    return claims.exp > Date.now() ? claims : null;
+    if (!(claims.exp > Date.now())) return null;
+    // Older sessions have no identity fields: they were the owner.
+    if (!claims.ws) { claims.ws = 'default'; claims.name = claims.name || 'Owner'; claims.admin = true; }
+    return claims;
   } catch (_) {
     return null;
   }
@@ -69,6 +89,30 @@ function codeMatches(supplied) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/**
+ * Additional people each get their own access code. Codes are never stored: we
+ * keep a keyed digest, which is enough to recognise a code at sign-in without
+ * being able to recover it.
+ */
+function codeDigest(code) {
+  return crypto.createHmac('sha256', keyMaterial()).update('user-code:' + String(code || '')).digest('base64url');
+}
+
+function digestsMatch(a, b) {
+  const x = Buffer.from(String(a || ''));
+  const y = Buffer.from(String(b || ''));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+/** A readable one-time code for a new person: 12 characters, no look-alikes. */
+function generateCode() {
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(12);
+  let out = '';
+  for (let i = 0; i < 12; i += 1) out += alphabet[bytes[i] % alphabet.length];
+  return out.slice(0, 4) + '-' + out.slice(4, 8) + '-' + out.slice(8);
+}
+
 /** Never let a secret reach a log line or a JSON response. */
 function redact(value) {
   if (!value) return null;
@@ -76,4 +120,4 @@ function redact(value) {
   return s.length <= 4 ? '••••' : `${'•'.repeat(8)}${s.slice(-2)}`;
 }
 
-module.exports = { seal, open, issueSession, verifySession, codeMatches, redact, SESSION_TTL_MS };
+module.exports = { seal, open, issueSession, verifySession, codeMatches, codeDigest, digestsMatch, generateCode, redact, SESSION_TTL_MS };

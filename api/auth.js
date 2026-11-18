@@ -3,10 +3,13 @@
 const http = require('./_http');
 const secrets = require('./_crypto');
 const store = require('./_store');
+const users = require('./_users');
 
 /**
- * Access-code sign in. The code is compared in constant time against the
- * ACCESS_CODE environment variable and is never echoed back.
+ * Access-code sign in. The owner's code is compared in constant time against the
+ * ACCESS_CODE environment variable; other people's codes are recognised by a
+ * keyed digest. Codes are never echoed back. Each person signs in to their own
+ * workspace, and any number of people can be signed in at once.
  *
  * Failed attempts are throttled per source address so the code cannot be
  * guessed by brute force.
@@ -30,10 +33,13 @@ module.exports = http.protect(async (req, res) => {
   }
 
   if (action === 'session') {
-    const session = http.sessionFrom(req);
+    let session = http.sessionFrom(req);
+    // A person who has been removed is signed out on their next request.
+    if (session && !(await users.isActive(session.ws))) session = null;
     return http.json(res, 200, {
       authenticated: Boolean(session),
-      expiresAt: session ? session.exp : null
+      expiresAt: session ? session.exp : null,
+      user: session ? { name: session.name, admin: session.admin === true } : null
     });
   }
 
@@ -51,7 +57,8 @@ module.exports = http.protect(async (req, res) => {
 
   record.attempts = (record.attempts || []).filter((t) => now - t < ATTEMPT_WINDOW_MS);
 
-  if (!secrets.codeMatches(body.code)) {
+  const identity = await users.authenticate(body.code);
+  if (!identity) {
     record.attempts.push(now);
     if (record.attempts.length >= MAX_ATTEMPTS) {
       record.lockedUntil = now + ATTEMPT_WINDOW_MS;
@@ -67,7 +74,11 @@ module.exports = http.protect(async (req, res) => {
   }
 
   await store.del(key);
-  const token = secrets.issueSession();
+  const token = secrets.issueSession(identity);
   http.setSessionCookie(res, token);
-  return http.json(res, 200, { ok: true, expiresAt: Date.now() + secrets.SESSION_TTL_MS });
+  return http.json(res, 200, {
+    ok: true,
+    expiresAt: Date.now() + secrets.SESSION_TTL_MS,
+    user: { name: identity.name, admin: identity.admin === true }
+  });
 }, { public: true, methods: ['POST'] });

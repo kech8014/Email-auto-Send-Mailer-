@@ -41,11 +41,14 @@ module.exports = async (req, res) => {
 
   // Sweep: restart any chain that stalled.
   if (wantsSweep) {
-    if (!isCron(req) && !http.sessionFrom(req)) {
+    const session = http.sessionFrom(req);
+    if (!isCron(req) && !session) {
       return http.json(res, 401, { error: 'Unauthorised' });
     }
     try {
-      const result = await worker.sweep();
+      // The scheduled sweep covers every workspace. A signed-in person's heartbeat
+      // only revives their own campaigns.
+      const result = await worker.sweep(isCron(req) ? undefined : (session.ws || 'default'));
       return http.json(res, 200, Object.assign({ ok: true, mode: 'sweep' }, result));
     } catch (err) {
       console.error('[tick] sweep failed:', err);
@@ -56,8 +59,16 @@ module.exports = async (req, res) => {
   if (!id) return http.json(res, 400, { error: 'Campaign id required' });
 
   const token = req.headers['x-worker-token'];
-  const authorised = (token && worker.verifyWorkerToken(id, token)) || isCron(req) || Boolean(http.sessionFrom(req));
-  if (!authorised) return http.json(res, 401, { error: 'Unauthorised' });
+  const trusted = (token && worker.verifyWorkerToken(id, token)) || isCron(req);
+  if (!trusted) {
+    // A signed-in person may only tick a campaign that is theirs.
+    const session = http.sessionFrom(req);
+    if (!session) return http.json(res, 401, { error: 'Unauthorised' });
+    const meta = await require('./_engine').getMeta(id);
+    if (!meta || require('./_engine').wsOf(meta) !== (session.ws || 'default')) {
+      return http.json(res, 404, { error: 'Campaign not found' });
+    }
+  }
 
   try {
     const result = await worker.runTick(id);

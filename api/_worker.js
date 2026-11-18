@@ -161,10 +161,12 @@ async function runTick(campaignId) {
     return { ok: true, status: meta.status, idle: true };
   }
 
-  const conn = await engine.getConnection();
+  // Each campaign sends through its own owner's mailbox, never anyone else's.
+  const resolved = await engine.resolveAccount(meta);
+  const conn = resolved.conn;
   if (!conn) {
     meta.status = 'blocked';
-    engine.pushEvent(meta, 'error', 'Mailbox disconnected - campaign halted');
+    engine.pushEvent(meta, 'error', resolved.reason ? engine.accountProblem(resolved) : 'Mailbox disconnected - campaign halted');
     await engine.setMeta(meta);
     await store.releaseLock(campaignId, lockToken);
     return { ok: false, error: 'No connection configured' };
@@ -390,8 +392,11 @@ async function runTick(campaignId) {
 }
 
 /** Restart any chain that died - called by cron and by the dashboard heartbeat. */
-async function sweep() {
-  const ids = await store.listCampaignIds();
+async function sweep(onlyWs) {
+  const users = require('./_users');
+  const workspaces = onlyWs ? [onlyWs] : await users.allWorkspaces();
+  const ids = [];
+  for (const ws of workspaces) ids.push(...(await store.listCampaignIds(ws)));
   const revived = [];
   for (const id of ids) {
     const meta = await engine.getMeta(id);

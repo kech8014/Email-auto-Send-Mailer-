@@ -16,8 +16,46 @@ const liveMetrics = view.liveMetrics;
  * nothing.
  */
 
-async function createAction(body) {
-  const conn = await engine.getConnection();
+/** The workspace of whoever is signed in. */
+const wsOfSession = (session) => (session && session.ws) || 'default';
+
+/**
+ * A person only ever sees and controls their own campaigns. A campaign that
+ * belongs to someone else is reported as not found - the same answer as one
+ * that does not exist - so ids cannot be probed.
+ */
+function ownsCampaign(meta, session) {
+  return Boolean(meta) && engine.wsOf(meta) === wsOfSession(session);
+}
+
+const NOT_FOUND = { status: 404, payload: { error: 'Campaign not found' } };
+
+/** Refuse to run two campaigns through one mailbox: they would share its sending limit. */
+async function busyError(meta) {
+  const busy = await engine.mailboxBusy(meta);
+  if (!busy) return null;
+  const conn = (await engine.resolveAccount(meta)).conn;
+  return {
+    status: 409,
+    payload: {
+      error: (conn ? conn.email : 'This mailbox') + ' is already sending "' + busy.name + '". '
+        + 'Two campaigns on one mailbox share its sending limit, which is how mailboxes get suspended. '
+        + 'Send this one from your other mailbox, or start it after the other finishes.',
+      busyWith: busy
+    }
+  };
+}
+
+async function createAction(body, session) {
+  const ws = wsOfSession(session);
+  // With several mailboxes connected, never guess: a silent default is how a
+  // campaign ends up sent from the wrong person's mailbox.
+  const mailboxes = await engine.listConnections(ws);
+  if (!body.accountId && mailboxes.length > 1) {
+    return { status: 400, payload: { error: 'Choose which mailbox this campaign sends from.' } };
+  }
+  const accountId = body.accountId || (mailboxes[0] ? mailboxes[0].id : engine.MAIN_ACCOUNT);
+  const conn = await engine.getConnection(ws, accountId);
   if (!conn) return { status: 400, payload: { error: 'Connect a sending mailbox first' } };
 
   const rows = Array.isArray(body.rows) ? body.rows : [];
@@ -26,6 +64,9 @@ async function createAction(body) {
   if (!body.emailField) return { status: 400, payload: { error: 'Select which column holds the email address' } };
 
   const meta = await engine.createCampaign({
+    ws,
+    accountId,
+    ownerName: session && session.name,
     name: body.name,
     rows,
     columns: body.columns || Object.keys(rows[0] || {}),
@@ -49,14 +90,22 @@ async function createAction(body) {
 }
 
 
-async function controlAction(body) {
+async function controlAction(body, session) {
   const meta = await engine.getMeta(body.id);
-  if (!meta) return { status: 404, payload: { error: 'Campaign not found' } };
-  const conn = await engine.getConnection();
+  if (!ownsCampaign(meta, session)) return NOT_FOUND;
+  // The mailbox this campaign was created for - and only that one.
+  const resolved = await engine.resolveAccount(meta);
+  const conn = resolved.conn;
+  const wrongMailbox = !conn && (body.command === 'start' || body.command === 'resume' || body.command === 'retry-failed')
+    ? { status: 400, payload: { error: engine.accountProblem(resolved), mailbox: resolved } }
+    : null;
+  if (wrongMailbox) return wrongMailbox;
 
   switch (body.command) {
     case 'start': {
       if (meta.status === 'running') return { status: 200, payload: { campaign: publicMeta(meta), note: 'Already running' } };
+      const conflict = await busyError(meta);
+      if (conflict) return conflict;
       const check = await engine.preflight(meta, conn);
       if (!check.canStart) {
         return { status: 400, payload: { error: 'Preflight failed', preflight: check } };
@@ -91,6 +140,8 @@ async function controlAction(body) {
       if (meta.status === 'stopped' && !conn) {
         return { status: 400, payload: { error: 'Connect a sending mailbox before resuming' } };
       }
+      const conflict = await busyError(meta);
+      if (conflict) return conflict;
       // Stop only flips the status; every row keeps its state, so the worker
       // picks up the remaining queued rows and never re-sends a sent one.
       const wasStopped = meta.status === 'stopped';
@@ -113,6 +164,10 @@ async function controlAction(body) {
     }
 
     case 'retry-failed': {
+      if (meta.status !== 'running') {
+        const conflict = await busyError(meta);
+        if (conflict) return conflict;
+      }
       let requeued = 0;
       for (let c = 0; c < Math.max(1, meta.chunkCount); c += 1) {
         const rows = await engine.getChunk(meta.id, c);
@@ -148,8 +203,8 @@ async function controlAction(body) {
 }
 
 /** Aggregate only what we can actually observe from our own send results. */
-async function analyticsAction() {
-  const campaigns = await engine.listCampaigns();
+async function analyticsAction(session) {
+  const campaigns = await engine.listCampaigns(wsOfSession(session));
   const now = Date.now();
   const days = 14;
   const buckets = new Array(days).fill(0).map((_, i) => ({
@@ -194,30 +249,30 @@ async function analyticsAction() {
   };
 }
 
-module.exports = http.protect(async (req, res) => {
+module.exports = http.protect(async (req, res, session) => {
   const body = await http.readJson(req, 24 * 1024 * 1024);
   const action = body.action;
   let result;
 
   switch (action) {
     case 'create':
-      result = await createAction(body);
+      result = await createAction(body, session);
       break;
 
     case 'list':
-      result = { status: 200, payload: { campaigns: await engine.listCampaigns() } };
+      result = { status: 200, payload: { campaigns: await engine.listCampaigns(wsOfSession(session)) } };
       break;
 
     case 'get': {
       const meta = await engine.getMeta(body.id);
-      if (!meta) { result = { status: 404, payload: { error: 'Campaign not found' } }; break; }
+      if (!ownsCampaign(meta, session)) { result = NOT_FOUND; break; }
       result = { status: 200, payload: { campaign: publicMeta(meta), metrics: liveMetrics(meta) } };
       break;
     }
 
     case 'recipients': {
       const meta = await engine.getMeta(body.id);
-      if (!meta) { result = { status: 404, payload: { error: 'Campaign not found' } }; break; }
+      if (!ownsCampaign(meta, session)) { result = NOT_FOUND; break; }
       const offset = Math.max(0, Number(body.offset) || 0);
       const limit = Math.min(500, Math.max(1, Number(body.limit) || 100));
       let rows = await engine.readRecipients(body.id, offset, limit);
@@ -232,8 +287,8 @@ module.exports = http.protect(async (req, res) => {
 
     case 'preflight': {
       const meta = await engine.getMeta(body.id);
-      if (!meta) { result = { status: 404, payload: { error: 'Campaign not found' } }; break; }
-      result = { status: 200, payload: { preflight: await engine.preflight(meta, await engine.getConnection()) } };
+      if (!ownsCampaign(meta, session)) { result = NOT_FOUND; break; }
+      result = { status: 200, payload: { preflight: await engine.preflight(meta, (await engine.resolveAccount(meta)).conn) } };
       break;
     }
 
@@ -256,15 +311,16 @@ module.exports = http.protect(async (req, res) => {
     }
 
     case 'control':
-      result = await controlAction(body);
+      result = await controlAction(body, session);
       break;
 
     case 'analytics':
-      result = await analyticsAction();
+      result = await analyticsAction(session);
       break;
 
     case 'delete': {
-      const meta = await engine.getMeta(body.id);
+      const found = await engine.getMeta(body.id);
+      const meta = ownsCampaign(found, session) ? found : null;
       if (meta) {
         // Halt first. A tick may be asleep in its pacing gap right now; the
         // loop re-reads status before every send, so marking it stopped closes
@@ -277,14 +333,60 @@ module.exports = http.protect(async (req, res) => {
         }
         for (let c = 0; c < Math.max(1, meta.chunkCount); c += 1) await store.del('campaigns/' + body.id + '/r/' + c);
         await store.del('campaigns/' + body.id);
-        await store.unindexCampaign(body.id);
+        await store.unindexCampaign(body.id, engine.wsOf(meta));
       }
       result = { status: 200, payload: { ok: true, deleted: Boolean(meta), wasRunning: Boolean(meta && meta.status === 'stopped') } };
       break;
     }
 
+    // Move a campaign that is not running to a different one of your mailboxes.
+    // Messages already sent stay as they were; the rest will go from the new one.
+    case 'move': {
+      const found = await engine.getMeta(body.id);
+      if (!ownsCampaign(found, session)) { result = NOT_FOUND; break; }
+      const meta = found;
+      if (meta.status === 'running') {
+        result = { status: 400, payload: { error: 'Pause or stop this campaign before moving it to another mailbox.' } };
+        break;
+      }
+      const ws = wsOfSession(session);
+      const target = await engine.getConnection(ws, body.accountId);
+      if (!target) { result = { status: 400, payload: { error: 'Choose one of your connected mailboxes.' } }; break; }
+      const before = await engine.resolveAccount(meta);
+      const fromEmail = (before.conn && before.conn.email) || (meta.sender && meta.sender.email) || 'its previous mailbox';
+      if (String(fromEmail).toLowerCase() === String(target.email).toLowerCase()) {
+        result = { status: 400, payload: { error: 'This campaign already sends from ' + target.email + '.' } };
+        break;
+      }
+      meta.accountId = body.accountId;
+      meta.sender = {
+        email: target.email,
+        name: target.fromName,
+        provider: target.provider ? target.provider.label : target.smtp.host,
+        domain: target.domain
+      };
+      // A campaign that was blocked only because its mailbox was missing can now go.
+      if (meta.status === 'blocked') meta.status = 'paused';
+      engine.pushEvent(meta, 'campaign', 'Moved to ' + target.email,
+        'Was ' + fromEmail + '. ' + meta.stats.sent + ' already sent from the old address; the remaining ' + meta.stats.queued + ' will send from the new one.');
+      await engine.setMeta(meta);
+      result = { status: 200, payload: { campaign: publicMeta(meta), from: fromEmail, to: target.email } };
+      break;
+    }
+
+    // Find campaigns that are saved but missing from the list, and put them back.
+    // The owner covers everyone's workspaces; anyone else only their own.
+    case 'recover': {
+      const scan = await engine.findUnlistedCampaigns();
+      const mine = (c) => wsOfSession(session) === 'default' && session.admin === true ? true : c.ws === wsOfSession(session);
+      const found = scan.unlisted.filter(mine);
+      const restored = body.dryRun === false ? await engine.restoreCampaigns(found) : 0;
+      result = { status: 200, payload: { supported: scan.supported, scanned: scan.scanned, found, restored } };
+      break;
+    }
+
     case 'suppress': {
-      const list = await engine.addSuppression(body.emails || []);
+      const list = await engine.addSuppression(body.emails || [], wsOfSession(session));
       result = { status: 200, payload: { suppressed: list.length } };
       break;
     }

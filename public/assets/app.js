@@ -19,7 +19,13 @@
       else if (key === 'html') node.innerHTML = value;
       else if (key === 'text') node.textContent = value;
       else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2), value);
-      else if (key === 'style' && typeof value === 'object') Object.assign(node.style, value);
+      else if (key === 'style' && typeof value === 'object') {
+        // Object.assign cannot set CSS custom properties (--name); setProperty can.
+        for (const [prop, v] of Object.entries(value)) {
+          if (prop.startsWith('--')) node.style.setProperty(prop, v);
+          else node.style[prop] = v;
+        }
+      }
       else node.setAttribute(key, value === true ? '' : value);
     }
     for (const child of [].concat(children || [])) {
@@ -207,12 +213,15 @@
 
   const state = {
     route: 'dashboard',
-    connection: null,
+    connection: null,    // the first connected mailbox (kept for the top bar)
+    connections: [],     // every connected mailbox, each with an id
+    maxMailboxes: 5,
     settings: null,
     campaigns: [],
     analytics: null,
     activeCampaignId: null,
     sessionExpiresAt: null,
+    user: null,          // who is signed in: { name, admin }
     campaign: null,
     metrics: null,
     stream: null,
@@ -528,13 +537,37 @@
     ]);
   }
 
+  /** Keep every mailbox in one place; the first one drives the top bar. */
+  function setConnections(list, max) {
+    state.connections = Array.isArray(list) ? list : [];
+    state.connection = state.connections[0] || null;
+    if (max) state.maxMailboxes = max;
+    if (state.draft && state.draft.accountId && !state.connections.some((c) => c.id === state.draft.accountId)) {
+      state.draft.accountId = null;
+    }
+  }
+
+  /** The mailbox the current draft will send from (the first one unless chosen). */
+  function selectedConnection() {
+    return state.connections.find((c) => c.id === (state.draft && state.draft.accountId)) || state.connections[0] || null;
+  }
+
+  /** What the "From" line should say: the chosen mailbox, or a prompt if none is chosen yet. */
+  function fromLabel() {
+    const unchosen = state.connections.length > 1 && !(state.draft && state.draft.accountId);
+    const c = unchosen ? null : selectedConnection();
+    if (!c) return '(choose a mailbox above)';
+    return c.fromName ? c.fromName + ' <' + c.email + '>' : c.email;
+  }
+
   function connectionPill(conn) {
     if (!conn) return { cls: 'pill--err', text: 'No mailbox' };
-    const state = conn.health ? conn.health.state : 'unknown';
-    if (state === 'connected') return { cls: 'pill--ok', text: conn.email };
-    if (state === 'invalid_credentials') return { cls: 'pill--err', text: 'Credentials rejected' };
-    if (state === 'unavailable') return { cls: 'pill--warn', text: 'Server unreachable' };
-    return { cls: 'pill--warn', text: conn.email };
+    const health = conn.health ? conn.health.state : 'unknown';
+    const more = state.connections.length > 1 ? '  (+' + (state.connections.length - 1) + ')' : '';
+    if (health === 'connected') return { cls: 'pill--ok', text: conn.email + more };
+    if (health === 'invalid_credentials') return { cls: 'pill--err', text: 'Credentials rejected' };
+    if (health === 'unavailable') return { cls: 'pill--warn', text: 'Server unreachable' };
+    return { cls: 'pill--warn', text: conn.email + more };
   }
 
   // ==========================================================================
@@ -684,7 +717,8 @@
             return el('tr', {}, [
               el('td', {}, [
                 el('div', { class: 'truncate', style: { maxWidth: '260px' }, text: c.name }),
-                el('div', { class: 'hint truncate', style: { maxWidth: '260px' }, text: c.subject || '(no subject)' })
+                el('div', { class: 'hint truncate', style: { maxWidth: '260px' }, text: c.subject || '(no subject)' }),
+                c.mailbox ? el('div', { style: { marginTop: '5px' } }, [mailboxChip(c.mailbox)]) : null
               ]),
               el('td', {}, [statePill(c.status)]),
               el('td', { class: 'num', text: fmtNum(c.stats.total) }),
@@ -699,6 +733,9 @@
               el('td', { class: 'hint', text: fmtDate(c.createdAt) }),
               el('td', {}, [el('div', { class: 'row', style: { gap: '6px', justifyContent: 'flex-end' } }, [
                 el('button', { class: 'btn btn--sm', text: 'Open', onclick: () => openCampaign(c.id) }),
+                state.connections.length > 1 && c.status !== 'running'
+                  ? el('button', { class: 'btn btn--sm', text: 'Move', title: 'Send the rest of this campaign from a different mailbox', onclick: () => moveCampaign(c) })
+                  : null,
                 el('button', { class: 'btn btn--sm btn--danger', text: 'Delete', title: 'Delete this campaign and its history', onclick: () => deleteCampaign(c) })
               ])])
             ]);
@@ -706,6 +743,54 @@
         ])
       ])
     ]);
+  }
+
+  /**
+   * Send the rest of a campaign from a different mailbox.
+   *
+   * What was already sent cannot change - those messages left from the old
+   * address. Only the people still waiting are affected, and the campaign stays
+   * exactly as it is (paused, stopped...) until it is resumed on purpose.
+   */
+  function moveCampaign(c) {
+    const here = c.mailbox && c.mailbox.email;
+    const others = state.connections.filter((m) => m.email !== here);
+    if (!others.length) return toast('Connect another mailbox first', 'warn');
+
+    const pick = el('select', { class: 'select' }, [
+      el('option', { value: '', text: 'Choose a mailbox…' }),
+      ...others.map((m) => el('option', { value: m.id, text: (m.fromName ? m.fromName + ' <' + m.email + '>' : m.email) }))
+    ]);
+    const remaining = c.stats.total - c.stats.sent - c.stats.failed - c.stats.skipped;
+    const confirmBtn = el('button', { class: 'btn btn--primary', text: 'Move campaign', disabled: true });
+    pick.addEventListener('change', () => { confirmBtn.disabled = !pick.value; });
+
+    const close = modal('Move “' + c.name + '”', el('div', {}, [
+      el('div', { class: 'callout', style: { marginBottom: '14px' } }, [
+        el('div', { class: 'hint', text: 'Currently sends from' }),
+        el('div', { style: { marginTop: '6px' } }, [mailboxChip(c.mailbox)])
+      ]),
+      el('div', { class: 'field' }, [el('label', { class: 'label', text: 'Send the rest from' }), pick]),
+      el('ul', { class: 'hint', style: { margin: '14px 0 0', paddingLeft: '18px', lineHeight: '1.7' } }, [
+        el('li', { text: fmtNum(c.stats.sent) + ' message(s) already sent stay as they are — they went out from ' + (here || 'the old address') + ' and cannot be recalled.' }),
+        el('li', { text: fmtNum(Math.max(0, remaining)) + ' recipient(s) still waiting will be sent from the mailbox you choose.' }),
+        el('li', { text: 'The campaign stays ' + c.status + ' until you resume it. Nothing is sent by moving it.' }),
+        el('li', { text: 'The new mailbox must not already be sending another campaign when you resume.' })
+      ])
+    ]), [
+      el('button', { class: 'btn', text: 'Cancel', onclick: () => close() }),
+      confirmBtn
+    ]);
+
+    confirmBtn.onclick = async () => {
+      confirmBtn.disabled = true;
+      try {
+        const res = await api('campaign', { action: 'move', id: c.id, accountId: pick.value });
+        close();
+        toast('Moved to ' + res.to + ' — ' + c.name + ' is still ' + c.status, 'ok', 6000);
+        render();
+      } catch (err) { toast(err.message, 'err'); confirmBtn.disabled = false; }
+    };
   }
 
   /**
@@ -755,22 +840,47 @@
   // ==========================================================================
 
   function viewConnection(root) {
+    const many = state.connections.length;
     root.appendChild(el('div', { class: 'hero' }, [
       el('p', { class: 'eyebrow', text: 'Configuration' }),
-      el('h1', { class: 'h-lg', style: { margin: '10px 0' }, text: state.connection ? 'Sending mailbox' : 'Connect a mailbox' }),
-      el('p', { class: 'lede', text: 'Kech sends through your own mail server. The password is encrypted with AES-256-GCM before it is stored and is only decrypted inside the sending worker.' })
+      el('h1', { class: 'h-lg', style: { margin: '10px 0' }, text: many > 1 ? 'Sending mailboxes' : many ? 'Sending mailbox' : 'Connect a mailbox' }),
+      el('p', { class: 'lede', text: 'Kech sends through your own mail server. The password is encrypted with AES-256-GCM before it is stored and is only decrypted inside the sending worker.' + (many ? ' Connect a second mailbox to run two campaigns at the same time — each campaign sends from one mailbox, and a mailbox only ever runs one campaign at a time.' : '') })
     ]));
 
-    if (state.connection) {
-      root.appendChild(connectedPanel());
-      root.appendChild(el('div', { style: { marginTop: '22px' } }, [
+    if (!many) {
+      root.appendChild(connectionForm('main'));
+      return;
+    }
+
+    state.connections.forEach((conn, i) => {
+      if (many > 1) {
+        root.appendChild(el('div', { class: 'between', style: { margin: (i ? '34px' : '6px') + ' 0 12px' } }, [
+          el('span', { class: 'label', text: 'Mailbox ' + (i + 1) + ' of ' + many })
+        ]));
+      }
+      root.appendChild(connectedPanel(conn));
+      root.appendChild(el('div', { style: { marginTop: '18px' } }, [
         el('details', {}, [
           el('summary', { class: 'label', style: { cursor: 'pointer', padding: '8px 0' }, text: 'Replace this connection' }),
-          el('div', { style: { marginTop: '14px' } }, [connectionForm()])
+          el('div', { style: { marginTop: '14px' } }, [connectionForm(conn.id)])
         ])
       ]));
-    } else {
-      root.appendChild(connectionForm());
+    });
+
+    // Add another mailbox, up to the limit.
+    if (many < state.maxMailboxes) {
+      root.appendChild(el('div', { class: 'card card--pad-lg', style: { marginTop: '34px', maxWidth: '760px' } }, [
+        el('div', { class: 'between' }, [
+          el('div', {}, [
+            el('span', { class: 'label', text: 'Add another mailbox' }),
+            el('p', { class: 'hint', style: { marginTop: '6px' }, text: 'Run campaigns on different mailboxes at the same time without sharing a sending limit. You can connect up to ' + state.maxMailboxes + '.' })
+          ])
+        ]),
+        el('details', { style: { marginTop: '14px' } }, [
+          el('summary', { class: 'btn btn--sm', style: { cursor: 'pointer', display: 'inline-flex' }, text: 'Connect another mailbox' }),
+          el('div', { style: { marginTop: '16px' } }, [connectionForm('new')])
+        ])
+      ]));
     }
   }
 
@@ -779,8 +889,7 @@
    * Editable on its own: it is not a credential, so changing it should not mean
    * re-entering a password and re-testing the servers.
    */
-  function senderNameField() {
-    const conn = state.connection;
+  function senderNameField(conn) {
     const input = el('input', {
       class: 'input',
       value: conn.fromName || '',
@@ -800,8 +909,11 @@
       const label = save.textContent;
       save.textContent = 'Saving…';
       try {
-        const data = await api('connection', { action: 'set-name', fromName: input.value });
-        state.connection = data.connection;
+        const data = await api('connection', { action: 'set-name', accountId: conn.id, fromName: input.value });
+        conn.fromName = data.connection.fromName;
+        const slot = state.connections.findIndex((c) => c.id === conn.id);
+        if (slot >= 0) state.connections[slot] = data.connection;
+        state.connection = state.connections[0] || null;
         updateChrome();
         toast('Sender name updated', 'ok');
         paint();
@@ -822,8 +934,7 @@
     ]);
   }
 
-  function connectedPanel() {
-    const conn = state.connection;
+  function connectedPanel(conn) {
     const health = conn.health || { state: 'unknown' };
     const healthMap = {
       connected: ['pill--ok', 'Connected'],
@@ -845,7 +956,7 @@
         ]),
         health.message ? el('p', { class: 'hint', style: { marginBottom: '16px' }, text: health.message }) : null,
         el('hr', { class: 'divider' }),
-        senderNameField(),
+        senderNameField(conn),
         el('hr', { class: 'divider' }),
         el('div', { class: 'grid grid--2' }, [
           el('div', {}, [
@@ -865,13 +976,14 @@
         ]),
         el('hr', { class: 'divider' }),
         el('div', { class: 'row row--wrap' }, [
-          el('button', { class: 'btn', text: 'Re-test connection', onclick: recheckConnection }),
+          el('button', { class: 'btn', text: 'Re-test connection', onclick: () => recheckConnection(conn.id) }),
           el('button', {
             class: 'btn btn--danger', text: 'Disconnect', onclick: async () => {
-              if (!(await confirmDialog('Disconnect mailbox', 'Running campaigns will stop until a mailbox is connected again. The stored password will be deleted.', 'Disconnect'))) return;
-              await api('connection', { action: 'disconnect' });
-              state.connection = null;
-              toast('Mailbox disconnected', 'warn');
+              if (!(await confirmDialog('Disconnect ' + conn.email, 'Any campaign sending from this mailbox will stop until it is connected again. The stored password will be deleted. Your other mailboxes are not affected.', 'Disconnect'))) return;
+              const res = await api('connection', { action: 'disconnect', accountId: conn.id });
+              setConnections(res.connections || []);
+              toast(conn.email + ' disconnected', 'warn');
+              updateChrome();
               render();
             }
           })
@@ -904,7 +1016,7 @@
     ]);
   }
 
-  function connectionForm() {
+  function connectionForm(accountId) {
     let discovered = null;
     let manual = false;
 
@@ -982,6 +1094,7 @@
 
     function payload() {
       const body = {
+        accountId: accountId || 'main',
         email: emailInput.value.trim(),
         password: passInput.value,
         fromName: nameInput.value.trim()
@@ -1049,10 +1162,12 @@
       withBusy(saveBtn, 'Saving…', async () => {
         try {
           const data = await api('connection', Object.assign({ action: 'save' }, payload()));
-          state.connection = data.connection;
+          setConnections(data.connections || [data.connection]);
           passInput.value = '';
           toast('Mailbox connected and verified', 'ok');
-          go('dashboard');
+          updateChrome();
+          // Adding or replacing from this page: stay here so the new mailbox is visible.
+          go(accountId === 'new' || state.connections.length > 1 ? 'connection' : 'dashboard');
         } catch (err) {
           toast(err.message, 'err');
           if (err.payload && err.payload.detail) renderResult(err.payload.detail);
@@ -1084,11 +1199,15 @@
     ]);
   }
 
-  async function recheckConnection() {
+  async function recheckConnection(accountId) {
     const dismiss = toast('Re-testing connection…', 'info', 30000);
     try {
-      const data = await api('connection', { action: 'recheck' });
-      state.connection = data.connection;
+      // From the top bar there is no specific mailbox: test the first one.
+      const id = typeof accountId === 'string' ? accountId : (state.connection && state.connection.id) || 'main';
+      const data = await api('connection', { action: 'recheck', accountId: id });
+      const slot = state.connections.findIndex((c) => c.id === data.connection.id);
+      if (slot >= 0) state.connections[slot] = data.connection;
+      state.connection = state.connections[0] || data.connection;
       dismiss();
       const ok = data.connection.health.state === 'connected';
       toast(ok ? 'Connection healthy' : data.connection.health.message, ok ? 'ok' : 'err');
@@ -1118,6 +1237,30 @@
       el('h1', { class: 'h-lg', style: { margin: '10px 0' }, text: 'Compose' }),
       el('p', { class: 'lede', text: 'Upload the list, write the message once, and Kech personalises every copy from the spreadsheet columns.' })
     ]));
+
+    // With more than one mailbox connected, say which one this campaign sends
+    // from. A mailbox that is already sending will be refused at start, so
+    // two campaigns never share one mailbox's sending limit.
+    if (state.connections.length > 1) {
+      const picker = el('select', {
+        class: 'select',
+        onchange: (e) => { draft.accountId = e.target.value || null; renderMessage(); renderLaunch(); }
+      }, [
+        el('option', { value: '', selected: !draft.accountId, text: 'Choose a mailbox…' }),
+        ...state.connections.map((c) => el('option', {
+          value: c.id,
+          selected: draft.accountId === c.id,
+          text: (c.fromName ? c.fromName + ' <' + c.email + '>' : c.email)
+        }))
+      ]);
+      root.appendChild(el('div', { class: 'card card--pad-lg', style: { marginBottom: '14px' } }, [
+        el('div', { class: 'field' }, [
+          el('label', { class: 'label', text: 'Send this campaign from' }),
+          picker,
+          el('p', { class: 'hint', style: { marginTop: '8px' }, text: 'Pick a different mailbox for each campaign to run two at the same time. A mailbox can only run one campaign at once.' })
+        ])
+      ]));
+    }
 
     const recipientsSection = el('div', { class: 'card card--pad-lg' });
     const messageSection = el('div', { class: 'card card--pad-lg', style: { marginTop: '14px' } });
@@ -1292,7 +1435,7 @@
           el('div', { class: 'between' }, [
             el('div', { style: { minWidth: 0 } }, [
               el('div', { class: 'truncate', style: { fontSize: '13.5px' }, text: subject || '(no subject)' }),
-              el('p', { class: 'hint truncate', text: 'From ' + (state.connection.fromName ? state.connection.fromName + ' <' + state.connection.email + '>' : state.connection.email) + '  ·  To ' + (sample[draft.emailField] || 'recipient@example.com') })
+              el('p', { class: 'hint truncate', text: 'From ' + fromLabel() + '  ·  To ' + (sample[draft.emailField] || 'recipient@example.com') })
             ]),
             el('div', { class: 'row', style: { gap: '6px', flex: 'none' } }, [
               el('button', { class: 'btn btn--sm', text: '‹', title: 'Previous recipient', disabled: previewRow === 0, onclick: () => { previewRow -= 1; paint(); } }),
@@ -1309,7 +1452,13 @@
 
       // The sender name is the first thing a recipient reads; make it fixable
       // here rather than only behind the connection form.
-      messageSection.appendChild(el('div', { class: 'card card--flat', style: { marginBottom: '18px' } }, [senderNameField()]));
+      // With several mailboxes it edits the one this campaign will send from, and
+      // waits until one has been chosen so it never edits the wrong one.
+      const sendingMailbox = state.connections.length > 1 && !draft.accountId ? null : selectedConnection();
+      messageSection.appendChild(el('div', { class: 'card card--flat', style: { marginBottom: '18px' } }, [
+        sendingMailbox ? senderNameField(sendingMailbox)
+          : el('p', { class: 'hint', text: 'Choose which mailbox to send from (at the top of this page) to set the sender name.' })
+      ]));
 
       messageSection.appendChild(el('div', { class: 'between', style: { marginBottom: '10px' } }, [
         el('span', { class: 'label', text: 'Live preview' }),
@@ -1433,7 +1582,7 @@
           el('div', { class: 'between' }, [
             el('div', { style: { minWidth: 0 } }, [
               el('div', { class: 'truncate', style: { fontSize: '13.5px' }, text: subject || '(no subject)' }),
-              el('p', { class: 'hint truncate', text: 'From ' + (state.connection.fromName ? state.connection.fromName + ' <' + state.connection.email + '>' : state.connection.email) + '  ·  To ' + (sample[draft.emailField] || 'recipient@example.com') })
+              el('p', { class: 'hint truncate', text: 'From ' + fromLabel() + '  ·  To ' + (sample[draft.emailField] || 'recipient@example.com') })
             ]),
             el('span', { class: 'pill', style: { flex: 'none' } }, [el('span', { class: 'dot' }), el('span', { text: 'Row 1' })])
           ])
@@ -1663,6 +1812,9 @@
       launchSection.innerHTML = '';
 
       const problems = [];
+      // With more than one mailbox the person must choose one on purpose. A silent
+      // default is how a campaign ends up sent from someone else's mailbox.
+      if (state.connections.length > 1 && !draft.accountId) problems.push('Choose which mailbox to send from');
       if (!draft.rows.length) problems.push('Upload a recipient list');
       if (!draft.emailField) problems.push('Choose the email column');
       if (!draft.subject.trim()) problems.push('Write a subject line');
@@ -1702,7 +1854,8 @@
           body: draft.body,
           isHtml: draft.isHtml,
           attachments: draft.attachments,
-          pacing: draft.pacing
+          pacing: draft.pacing,
+          accountId: (selectedConnection() || {}).id || 'main'
         });
         dismiss();
         showPreflight(data.campaign, data.preflight);
@@ -2219,11 +2372,122 @@
   //  VIEW - CAMPAIGNS
   // ==========================================================================
 
+  // Each mailbox keeps one accent colour everywhere it appears.
+  const MBX_COLORS = ['#7aa7ff', '#c79bff', '#ffb27a', '#7ae0c3', '#ff8fb0'];
+  function mailboxColor(id) {
+    const i = state.connections.findIndex((c) => c.id === id);
+    return MBX_COLORS[(i < 0 ? MBX_COLORS.length - 1 : i) % MBX_COLORS.length];
+  }
+
+  /** A small "sends from" tag: colour dot + address. Red when the mailbox is not connected. */
+  function mailboxChip(mb) {
+    if (!mb) return null;
+    const bad = mb.connected === false;
+    return el('span', { class: 'mbx-chip' + (bad ? ' mbx-chip--bad' : ''), title: bad ? (mb.problem || 'Mailbox not connected') : 'Sends only from ' + mb.email }, [
+      el('span', { class: 'mbx-dot', style: { '--lane': bad ? 'var(--err)' : mailboxColor(mb.id) } }),
+      el('span', { class: 'truncate', text: (bad ? 'not connected · ' : '') + (mb.email || 'unknown mailbox') })
+    ]);
+  }
+
+  /**
+   * Group campaigns by the mailbox they send from. Every connected mailbox gets a
+   * group even when it has no campaigns yet, and a campaign whose mailbox is not
+   * connected is kept apart in its own group - never folded into another mailbox.
+   */
+  function groupByMailbox(campaigns) {
+    const groups = state.connections.map((c) => ({ key: 'id:' + c.id, id: c.id, email: c.email, conn: c, connected: true, campaigns: [] }));
+    for (const camp of campaigns) {
+      const mb = camp.mailbox || { id: 'main', email: camp.sender && camp.sender.email, connected: true };
+      const key = mb.connected ? 'id:' + mb.id : 'missing:' + (mb.email || '?');
+      let g = groups.find((x) => x.key === key);
+      if (!g) {
+        g = { key, id: mb.id, email: mb.email || 'Unknown mailbox', conn: null, connected: false, problem: mb.problem, campaigns: [] };
+        groups.push(g);
+      }
+      g.campaigns.push(camp);
+    }
+    return groups;
+  }
+
+  function mailboxHealth(conn) {
+    const h = conn && conn.health ? conn.health.state : 'unknown';
+    return ({
+      connected: ['pill--ok', 'Connected'],
+      invalid_credentials: ['pill--err', 'Credentials rejected'],
+      unavailable: ['pill--warn', 'Unavailable'],
+      error: ['pill--err', 'Error']
+    })[h] || ['pill--warn', 'Not verified'];
+  }
+
+  /** One card per mailbox: what it is sending right now and how much it has sent lately. */
+  function mailboxCard(g, onFocus) {
+    const count = (s) => g.campaigns.filter((c) => c.status === s).length;
+    const running = g.campaigns.filter((c) => c.status === 'running');
+    const hour = g.campaigns.reduce((n, c) => n + (c.sentLastHour || 0), 0);
+    const day = g.campaigns.reduce((n, c) => n + (c.sentLast24h || 0), 0);
+    const live = running[0];
+    const [cls, label] = g.connected ? mailboxHealth(g.conn) : ['pill--err', 'Not connected'];
+    const caps = live && live.pacing ? live.pacing : null;
+
+    let now;
+    if (!g.connected) {
+      now = el('div', { class: 'lane__now' }, [
+        el('div', { class: 'hint', style: { color: 'var(--err)' }, text: g.problem || 'This mailbox is not connected, so nothing can send from it.' })
+      ]);
+    } else if (live) {
+      const settled = live.stats.sent + live.stats.failed + live.stats.skipped;
+      const pct = live.stats.total ? (settled / live.stats.total) * 100 : 0;
+      now = el('div', { class: 'lane__now' }, [
+        el('div', { class: 'between' }, [
+          el('span', { class: 'pill pill--ok pill--live' }, [el('span', { class: 'dot' }), el('span', { text: 'Sending now' })]),
+          el('button', { class: 'btn btn--sm', text: 'Watch', onclick: () => openCampaign(live.id) })
+        ]),
+        el('div', { style: { marginTop: '10px', fontSize: '13.5px' }, class: 'truncate', text: live.name }),
+        el('div', { class: 'progress progress--tall', style: { marginTop: '10px' } }, [el('div', { class: 'bar', style: { width: pct + '%' } })]),
+        el('div', { class: 'between', style: { marginTop: '8px' } }, [
+          el('span', { class: 'hint', text: fmtNum(live.stats.sent) + ' of ' + fmtNum(live.stats.total) + ' sent' }),
+          el('span', { class: 'hint', text: caps ? 'cap ' + caps.hourlyCap + '/hr · ' + caps.dailyCap + '/day' : '' })
+        ]),
+        running.length > 1 ? el('p', { class: 'hint', style: { color: 'var(--err)', marginTop: '8px' }, text: running.length + ' campaigns are running on this mailbox - stop all but one.' }) : null
+      ]);
+    } else {
+      now = el('div', { class: 'lane__now' }, [
+        el('div', { class: 'between' }, [
+          el('span', { class: 'pill' }, [el('span', { class: 'dot' }), el('span', { text: 'Idle' })]),
+          el('span', { class: 'hint', text: 'free to start a campaign' })
+        ])
+      ]);
+    }
+
+    return el('div', { class: 'lane' + (live ? ' lane--busy' : ''), style: { '--lane': g.connected ? mailboxColor(g.id) : 'var(--err)' } }, [
+      el('div', { class: 'between', style: { alignItems: 'flex-start' } }, [
+        el('div', { style: { minWidth: 0 } }, [
+          el('span', { class: 'label', text: g.connected ? 'Mailbox' : 'Mailbox not connected' }),
+          el('div', { class: 'lane__email', style: { marginTop: '6px' }, text: g.email })
+        ]),
+        el('span', { class: 'pill ' + cls }, [el('span', { class: 'dot' }), el('span', { text: label })])
+      ]),
+      el('div', { class: 'lane__nums' }, [
+        el('div', { class: 'lane__num' }, [el('b', { text: fmtNum(g.campaigns.length) }), el('span', { text: 'campaigns' })]),
+        el('div', { class: 'lane__num' }, [el('b', { text: fmtNum(count('paused') + count('stopped') + count('blocked')) }), el('span', { text: 'paused / stopped' })]),
+        el('div', { class: 'lane__num' }, [el('b', { text: fmtNum(hour) }), el('span', { text: 'sent last hr' })]),
+        el('div', { class: 'lane__num' }, [el('b', { text: fmtNum(day) }), el('span', { text: 'sent last 24h' })])
+      ]),
+      now,
+      el('div', { class: 'row row--wrap', style: { marginTop: '14px', gap: '8px' } }, [
+        el('button', { class: 'btn btn--sm', text: 'Show only this mailbox', onclick: () => onFocus(g.key) }),
+        g.connected ? el('button', {
+          class: 'btn btn--sm', text: 'New campaign from here', onclick: () => { state.draft.accountId = g.id; go('compose'); }
+        }) : el('button', { class: 'btn btn--sm', text: 'Go to Connection', onclick: () => go('connection') })
+      ])
+    ]);
+  }
+
   async function viewCampaigns(root) {
     root.appendChild(el('div', { class: 'hero' }, [
       el('p', { class: 'eyebrow', text: 'History' }),
       el('h1', { class: 'h-lg', style: { margin: '10px 0' }, text: 'Campaigns' }),
-      el('p', { class: 'lede', text: 'Every campaign, with the exact transport result for each recipient.' })
+      el('p', { class: 'lede', text: 'Every campaign belongs to exactly one mailbox. They are grouped by mailbox below, so one mailbox’s campaigns are never mixed with another’s.' })
     ]));
 
     const wrap = el('div');
@@ -2231,9 +2495,24 @@
     wrap.appendChild(el('div', { class: 'skeleton', style: { height: '220px' } }));
 
     try {
+      // A campaign can be saved yet missing from the list if two people save at the
+      // same moment. Look for any, and put them back before showing the list.
+      let recovered = [];
+      try {
+        const rec = await api('campaign', { action: 'recover', dryRun: false });
+        if (rec.restored > 0) recovered = rec.found;
+      } catch (_) { /* the list below still loads */ }
+
       const campaigns = (await api('campaign', { action: 'list' })).campaigns;
       state.campaigns = campaigns;
       wrap.innerHTML = '';
+
+      if (recovered.length) {
+        wrap.appendChild(el('div', { class: 'callout callout--warn', style: { marginBottom: '14px' } }, [
+          el('div', { style: { fontSize: '13px' }, text: recovered.length + (recovered.length === 1 ? ' campaign was' : ' campaigns were') + ' saved but missing from this list, and ' + (recovered.length === 1 ? 'has' : 'have') + ' been restored.' }),
+          el('div', { class: 'hint', style: { marginTop: '6px' }, text: recovered.map((c) => c.name + ' (' + c.status + (c.mailbox ? ', ' + c.mailbox : '') + ')').join('  ·  ') })
+        ]));
+      }
 
       if (!campaigns.length) {
         wrap.appendChild(emptyState('No campaigns yet', 'Your first campaign will appear here with a full per-recipient record.',
@@ -2241,30 +2520,112 @@
         return;
       }
 
+      const groups = groupByMailbox(campaigns);
+      const multi = state.connections.length > 1 || groups.length > 1;
       let filter = 'all';
+      let focus = 'all';           // 'all' or a group key
       const search = el('input', { class: 'input', placeholder: 'Search by name or subject…', style: { maxWidth: '280px', height: '34px' } });
-      const table = el('div');
+      const sections = el('div');
+      const chipRow = el('div', { class: 'row row--wrap', style: { gap: '8px' } });
+      const note = el('div');
 
-      const paint = () => {
+      // ---- 1. how separation works (only meaningful with more than one mailbox) ----
+      if (multi) {
+        wrap.appendChild(el('div', { class: 'card card--pad-lg', style: { marginBottom: '14px' } }, [
+          el('span', { class: 'label', text: 'How your mailboxes are kept separate' }),
+          el('div', { class: 'rules', style: { marginTop: '16px' } }, [
+            el('div', { class: 'rule' }, [el('span', { class: 'n', text: '1' }), el('div', {}, [
+              el('div', { style: { fontSize: '13px' }, text: 'Locked when it is created' }),
+              el('div', { class: 'hint', text: 'Each campaign is tied to one mailbox address and can only ever send from that address.' })
+            ])]),
+            el('div', { class: 'rule' }, [el('span', { class: 'n', text: '2' }), el('div', {}, [
+              el('div', { style: { fontSize: '13px' }, text: 'One campaign per mailbox' }),
+              el('div', { class: 'hint', text: 'A mailbox runs one campaign at a time, so campaigns never share a sending limit. Different mailboxes run side by side.' })
+            ])]),
+            el('div', { class: 'rule' }, [el('span', { class: 'n', text: '3' }), el('div', {}, [
+              el('div', { style: { fontSize: '13px' }, text: 'Checked on every send' }),
+              el('div', { class: 'hint', text: 'If a campaign’s mailbox is missing or has a different address, it sends nothing and tells you why.' })
+            ])])
+          ])
+        ]));
+      }
+
+      // ---- 2. one card per mailbox ----
+      const setFocus = (key) => { focus = key; paintChips(); paint(); window.scrollTo({ top: sections.offsetTop - 80, behavior: 'smooth' }); };
+      wrap.appendChild(el('div', { class: 'lane-grid' }, groups.map((g) => mailboxCard(g, setFocus))));
+
+      // ---- 3. filters ----
+      const statusTabs = el('div', { class: 'tabs' }, ['all', 'running', 'completed', 'paused', 'stopped'].map((f) => el('button', {
+        class: 'tab' + (f === filter ? ' is-active' : ''),
+        text: f[0].toUpperCase() + f.slice(1),
+        onclick: (e) => { filter = f; $$('.tab', statusTabs).forEach((t) => t.classList.remove('is-active')); e.target.classList.add('is-active'); paint(); }
+      })));
+
+      function paintChips() {
+        chipRow.innerHTML = '';
+        if (!multi) return;
+        const chip = (key, label, color, n) => el('button', {
+          class: 'filter-chip' + (focus === key ? ' is-active' : ''), style: { '--lane': color || 'var(--text-2)' },
+          onclick: () => { focus = key; paintChips(); paint(); }
+        }, [color ? el('span', { class: 'mbx-dot', style: { '--lane': color } }) : null, el('span', { text: label }), el('span', { class: 'count', text: String(n) })]);
+        chipRow.appendChild(chip('all', 'All mailboxes', null, campaigns.length));
+        for (const g of groups) chipRow.appendChild(chip(g.key, g.email, g.connected ? mailboxColor(g.id) : 'var(--err)', g.campaigns.length));
+      }
+
+      wrap.appendChild(el('div', { class: 'lane-section' }, [
+        el('div', { class: 'between', style: { flexWrap: 'wrap', gap: '12px', marginBottom: '14px' } }, [
+          el('h2', { class: 'h-md', text: multi ? 'Campaigns by mailbox' : 'All campaigns' }),
+          search
+        ]),
+        multi ? el('div', { style: { marginBottom: '12px' } }, [chipRow]) : null,
+        el('div', { style: { marginBottom: '4px' } }, [statusTabs]),
+        note
+      ]));
+      wrap.appendChild(sections);
+
+      // ---- 4. a section per mailbox ----
+      function paint() {
         const q = search.value.trim().toLowerCase();
-        const list = campaigns.filter((c) =>
-          (filter === 'all' || c.status === filter) &&
-          (!q || c.name.toLowerCase().includes(q) || String(c.subject || '').toLowerCase().includes(q)));
-        table.innerHTML = '';
-        table.appendChild(list.length ? campaignTable(list) : emptyState('No matches', 'Try a different filter or search term.'));
-      };
+        const match = (c) => (filter === 'all' || c.status === filter) &&
+          (!q || c.name.toLowerCase().includes(q) || String(c.subject || '').toLowerCase().includes(q));
+        sections.innerHTML = '';
+        note.innerHTML = '';
+        let shown = 0;
+
+        for (const g of groups) {
+          if (focus !== 'all' && focus !== g.key) continue;
+          const list = g.campaigns.filter(match);
+          // A mailbox with nothing to show under the current filter is skipped, unless it has no campaigns at all.
+          if (!list.length && (filter !== 'all' || q || g.campaigns.length)) continue;
+          shown += list.length;
+
+          const color = g.connected ? mailboxColor(g.id) : 'var(--err)';
+          const running = g.campaigns.filter((c) => c.status === 'running').length;
+          sections.appendChild(el('div', { class: 'lane-section', style: { '--lane': color } }, [
+            el('div', { class: 'lane-section__head' }, [
+              el('div', { class: 'row', style: { gap: '12px', minWidth: 0 } }, [
+                el('span', { class: 'mbx-dot', style: { '--lane': color } }),
+                el('div', { style: { minWidth: 0 } }, [
+                  el('div', { class: 'h-md truncate', text: g.email }),
+                  el('div', { class: 'hint', text: g.connected
+                    ? 'These campaigns send only from this mailbox · ' + fmtNum(g.campaigns.length) + ' total' + (running ? ' · 1 sending now' : ' · none sending')
+                    : 'Their mailbox is not connected, so none of them can send.' })
+                ])
+              ]),
+              g.connected ? el('span', { class: 'pill ' + mailboxHealth(g.conn)[0] }, [el('span', { class: 'dot' }), el('span', { text: mailboxHealth(g.conn)[1] })])
+                : el('button', { class: 'btn btn--sm', text: 'Connect it again', onclick: () => go('connection') })
+            ]),
+            !g.connected && g.problem ? el('div', { class: 'callout callout--err', style: { marginBottom: '12px' } }, [el('div', { class: 'hint', style: { color: 'var(--err)' }, text: g.problem })]) : null,
+            list.length ? campaignTable(list)
+              : el('div', { class: 'table-wrap' }, [emptyState('No campaigns on this mailbox yet', g.connected ? 'It is free: start one from the Compose page and pick this mailbox.' : 'Nothing to show.',
+                g.connected ? el('button', { class: 'btn btn--primary', text: 'New campaign from here', onclick: () => { state.draft.accountId = g.id; go('compose'); } }) : null)])
+          ]));
+        }
+        if (!sections.children.length) sections.appendChild(emptyState('No matches', 'Try a different filter, mailbox or search term.'));
+      }
 
       search.oninput = debounce(paint, 220);
-
-      wrap.appendChild(el('div', { class: 'between', style: { marginBottom: '14px', flexWrap: 'wrap', gap: '10px' } }, [
-        el('div', { class: 'tabs' }, ['all', 'running', 'completed', 'paused', 'stopped'].map((f) => el('button', {
-          class: 'tab' + (f === filter ? ' is-active' : ''),
-          text: f[0].toUpperCase() + f.slice(1),
-          onclick: (e) => { filter = f; $$('.tab', wrap).forEach((t) => t.classList.remove('is-active')); e.target.classList.add('is-active'); paint(); }
-        }))),
-        search
-      ]));
-      wrap.appendChild(table);
+      paintChips();
       paint();
     } catch (err) {
       wrap.innerHTML = '';
@@ -2353,6 +2714,9 @@
       ])
     ]));
 
+    // Only the owner sees this. Everyone else works in their own workspace.
+    if (state.user && state.user.admin) wrap.appendChild(peopleCard());
+
     wrap.appendChild(el('div', { class: 'row', style: { marginTop: '18px' } }, [
       el('button', {
         class: 'btn btn--primary', text: 'Save settings', onclick: async (e) => {
@@ -2366,6 +2730,110 @@
         }
       })
     ]));
+  }
+
+  // ---- People: let several people run campaigns at the same time -------------
+
+  /** Show a one-time code. It is never shown again, so make it easy to copy. */
+  function showCodeDialog(title, name, code) {
+    const box = el('input', { class: 'input num', value: code, readonly: true, style: { fontSize: '20px', letterSpacing: '1px', textAlign: 'center' } });
+    const close = modal(title, el('div', {}, [
+      el('p', { class: 'lede', text: 'Give this code to ' + name + '. It is shown only once and cannot be looked up later - if it is lost, issue a new one.' }),
+      el('div', { class: 'field', style: { marginTop: '16px' } }, [box]),
+      el('p', { class: 'hint', style: { marginTop: '12px' }, text: name + ' signs in with it on the same sign-in page, then connects their own mailbox. They only ever see their own campaigns.' })
+    ]), [
+      el('button', {
+        class: 'btn', text: 'Copy code', onclick: async (e) => {
+          try { await navigator.clipboard.writeText(code); e.target.textContent = 'Copied'; }
+          catch (_) { box.select(); }
+        }
+      }),
+      el('button', { class: 'btn btn--primary', text: 'Done', onclick: () => close() })
+    ]);
+    setTimeout(() => box.select(), 40);
+  }
+
+  function peopleCard() {
+    const list = el('div', { style: { marginTop: '14px' } });
+    const card = el('div', { class: 'card card--pad-lg', style: { marginTop: '14px' } }, [
+      el('div', { class: 'between' }, [
+        el('div', {}, [
+          el('span', { class: 'label', text: 'People' }),
+          el('p', { class: 'hint', style: { marginTop: '6px' }, text: 'Each person signs in with their own code and gets their own mailbox, campaigns, suppression list and settings, so several people can send at the same time without touching each other.' })
+        ]),
+        el('button', { class: 'btn btn--sm', text: 'Add person', onclick: addPerson })
+      ]),
+      list
+    ]);
+
+    async function refresh() {
+      list.innerHTML = '';
+      let res;
+      try { res = await api('settings', { action: 'users-list' }); }
+      catch (err) { list.appendChild(el('p', { class: 'hint hint--err', text: err.message })); return; }
+
+      list.appendChild(el('div', { class: 'between', style: { padding: '10px 0', borderTop: '1px solid var(--line, rgba(255,255,255,.08))' } }, [
+        el('div', {}, [el('strong', { text: (state.user && state.user.name) || 'Owner' }), el('span', { class: 'hint', text: '  ·  owner (you)' })])
+      ]));
+      if (!res.users.length) {
+        list.appendChild(el('p', { class: 'hint', style: { marginTop: '8px' }, text: 'No one else has been added yet.' }));
+      }
+      for (const u of res.users) {
+        list.appendChild(el('div', { class: 'between', style: { padding: '10px 0', borderTop: '1px solid var(--line, rgba(255,255,255,.08))' } }, [
+          el('div', {}, [el('strong', { text: u.name }), el('span', { class: 'hint', text: '  ·  added ' + new Date(u.createdAt).toLocaleDateString() })]),
+          el('div', { class: 'row' }, [
+            el('button', { class: 'btn btn--sm', text: 'New code', onclick: () => newCode(u) }),
+            el('button', { class: 'btn btn--sm btn--danger', text: 'Remove', onclick: () => removePerson(u) })
+          ])
+        ]));
+      }
+    }
+
+    function addPerson() {
+      const input = el('input', { class: 'input', placeholder: 'e.g. Alex Rivera', autocomplete: 'off' });
+      const submit = el('button', {
+        class: 'btn btn--primary', text: 'Add and show code', onclick: async (e) => {
+          const name = input.value.trim();
+          if (!name) return input.focus();
+          e.target.disabled = true;
+          try {
+            const res = await api('settings', { action: 'users-add', name });
+            close();
+            showCodeDialog('Sign-in code for ' + res.user.name, res.user.name, res.code);
+            refresh();
+          } catch (err) { toast(err.message, 'err'); e.target.disabled = false; }
+        }
+      });
+      const close = modal('Add a person', el('div', {}, [
+        el('p', { class: 'hint', style: { marginBottom: '12px' }, text: 'They get their own sign-in code and a separate workspace. They connect their own mailbox, so nothing is shared with you or anyone else.' }),
+        input
+      ]), [
+        el('button', { class: 'btn', text: 'Cancel', onclick: () => close() }),
+        submit
+      ]);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit.click(); } });
+      setTimeout(() => input.focus(), 40);
+    }
+
+    async function newCode(u) {
+      if (!(await confirmDialog('Issue a new code for ' + u.name + '?', 'Their current code stops working immediately. They stay signed in until their session ends.', 'Issue new code'))) return;
+      try {
+        const res = await api('settings', { action: 'users-reset', id: u.id });
+        showCodeDialog('New code for ' + u.name, u.name, res.code);
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function removePerson(u) {
+      if (!(await confirmDialog('Remove ' + u.name + '?', 'They are signed out at once and their code stops working. Any campaign of theirs that is still running is stopped. Their data is kept.', 'Remove'))) return;
+      try {
+        const res = await api('settings', { action: 'users-remove', id: u.id });
+        toast(u.name + ' removed' + (res.stoppedCampaigns ? ' · ' + res.stoppedCampaigns + ' running campaign stopped' : ''), 'ok');
+        refresh();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    refresh();
+    return card;
   }
 
   function showSuppressionDialog() {
@@ -2442,6 +2910,7 @@
     const meta = $('#footer-meta');
     if (meta) {
       const bits = ['Kech v1.0.0'];
+      if (state.user && state.user.name) bits.push('signed in as ' + state.user.name);
       if (state.sessionExpiresAt) bits.push('session until ' + fmtTime(state.sessionExpiresAt));
       meta.textContent = bits.join('  ·  ');
     }
@@ -2484,7 +2953,7 @@
         api('settings', { action: 'get' }),
         api('campaign', { action: 'list' })
       ]);
-      state.connection = conn.connection;
+      setConnections(conn.connections || (conn.connection ? [conn.connection] : []), conn.max);
       state.settings = settings.settings;
       state.campaigns = list.campaigns;
     } catch (err) {
@@ -2518,6 +2987,7 @@
     try {
       const result = await api('auth', { action: 'login', code: $('#gate-code').value });
       state.sessionExpiresAt = result.expiresAt;
+      state.user = result.user || null;
       $('#gate-code').value = '';
       await enterConsole();
     } catch (err) {
@@ -2533,7 +3003,12 @@
   $('#sign-out').addEventListener('click', async () => {
     await api('auth', { action: 'logout' }).catch(() => {});
     state.connection = null;
+    state.connections = [];
     state.campaigns = [];
+    state.user = null;
+    state.settings = null;
+    state.campaign = null;
+    state.activeCampaignId = null;
     showGate('Signed out.');
   });
 
@@ -2561,6 +3036,7 @@
       const session = await api('auth', { action: 'session' });
       if (session.authenticated) {
         state.sessionExpiresAt = session.expiresAt;
+        state.user = session.user || null;
         return enterConsole();
       }
     } catch (_) {}

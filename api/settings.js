@@ -2,6 +2,7 @@
 
 const http = require('./_http');
 const engine = require('./_engine');
+const users = require('./_users');
 
 /** Workspace defaults: pacing policy, retry policy, templates, retention. */
 
@@ -32,13 +33,34 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
-module.exports = http.protect(async (req, res) => {
+module.exports = http.protect(async (req, res, session) => {
   const body = await http.readJson(req, 128 * 1024);
+  // Settings and the suppression list belong to whoever is signed in.
+  const ws = (session && session.ws) || 'default';
+  const isOwner = Boolean(session && session.admin === true && ws === 'default');
+
+  // ---- People (owner only) -------------------------------------------------
+  if (typeof body.action === 'string' && body.action.startsWith('users-')) {
+    if (!isOwner) return http.json(res, 403, { error: 'Only the owner can manage people' });
+    if (body.action === 'users-list') {
+      return http.json(res, 200, { users: await users.listUsers() });
+    }
+    if (body.action === 'users-add') {
+      return http.json(res, 200, await users.addUser(body.name));
+    }
+    if (body.action === 'users-reset') {
+      return http.json(res, 200, await users.resetCode(String(body.id || '')));
+    }
+    if (body.action === 'users-remove') {
+      return http.json(res, 200, await users.removeUser(String(body.id || ''), engine));
+    }
+    return http.json(res, 400, { error: 'Unknown action' });
+  }
 
   if (body.action === 'get') {
     return http.json(res, 200, {
-      settings: await engine.getSettings(),
-      suppression: (await engine.getSuppression()).length
+      settings: await engine.getSettings(ws),
+      suppression: (await engine.getSuppression(ws)).length
     });
   }
 
@@ -50,15 +72,15 @@ module.exports = http.protect(async (req, res) => {
       if (body[key] !== undefined) patch[key] = body[key];
     }
     if (body.retentionDays !== undefined) patch.retentionDays = clamp(Number(body.retentionDays), 1, 3650);
-    return http.json(res, 200, { settings: await engine.saveSettings(patch) });
+    return http.json(res, 200, { settings: await engine.saveSettings(patch, ws) });
   }
 
   if (body.action === 'suppression-list') {
-    return http.json(res, 200, { emails: await engine.getSuppression() });
+    return http.json(res, 200, { emails: await engine.getSuppression(ws) });
   }
 
   if (body.action === 'suppression-add') {
-    const list = await engine.addSuppression((body.emails || []).map(engine.normalizeEmail).filter(engine.isValidEmail));
+    const list = await engine.addSuppression((body.emails || []).map(engine.normalizeEmail).filter(engine.isValidEmail), ws);
     return http.json(res, 200, { suppressed: list.length });
   }
 

@@ -4,6 +4,7 @@ const http = require('./_http');
 const store = require('./_store');
 const secrets = require('./_crypto');
 const engine = require('./_engine');
+const users = require('./_users');
 const providers = require('./_providers');
 
 /**
@@ -97,14 +98,67 @@ async function testAction(body) {
   };
 }
 
-async function saveAction(body) {
+/**
+ * Is this address already connected in someone else's workspace? Returns that
+ * person's name, or null. It reads the live connections rather than a separate
+ * registry, so there is nothing to keep in sync or migrate.
+ */
+async function mailboxHeldByAnother(email, ws) {
+  const people = await users.listUsers();
+  const nameOf = (w) => (w === 'default' ? 'the owner' : ((people.find((p) => p.id === w) || {}).name || 'another person'));
+  for (const other of await users.allWorkspaces()) {
+    if (other === ws) continue;
+    const theirs = await engine.listConnections(other);
+    if (theirs.some((m) => m.conn.email === email)) return nameOf(other);
+  }
+  return null;
+}
+
+/** A mailbox with its id, in the shape the browser needs. */
+function view(id, conn) {
+  return Object.assign({ id }, engine.publicConnection(conn));
+}
+
+async function listView(ws) {
+  return (await engine.listConnections(ws)).map((m) => view(m.id, m.conn));
+}
+
+/**
+ * Save a mailbox. `accountId` says which one: an existing id replaces it, "new"
+ * adds another (up to the limit), and nothing means the main one. The same
+ * address cannot be connected twice - two entries for one mailbox would share its
+ * sending limit and defeat the point of having two.
+ */
+async function saveAction(body, ws) {
+  const existing = await engine.listConnections(ws);
+  let accountId = body.accountId || engine.MAIN_ACCOUNT;
+  const email = engine.normalizeEmail(body.email);
+
+  if (accountId === 'new') {
+    if (existing.length >= engine.MAX_MAILBOXES) {
+      return { status: 400, payload: { error: 'You can connect up to ' + engine.MAX_MAILBOXES + ' mailboxes. Disconnect one to add another.' } };
+    }
+    accountId = engine.newAccountId();
+  }
+  const clash = existing.find((m) => m.id !== accountId && m.conn.email === email);
+  if (clash) {
+    return { status: 400, payload: { error: email + ' is already connected. Each mailbox can only be connected once, so campaigns on it never share a sending limit.' } };
+  }
+
+  // Nor can two different people connect the same mailbox: they would share one
+  // provider sending limit without either being able to see the other's sending,
+  // which is exactly how a mailbox gets suspended.
+  const holder = await mailboxHeldByAnother(email, ws);
+  if (holder) {
+    return { status: 400, payload: { error: email + ' is already connected by ' + holder + '. A mailbox can only be used by one person at a time - ask them to disconnect it first, or use a different mailbox.' } };
+  }
+
   const test = await testAction(body);
   if (test.status !== 200) return test;
   if (!test.payload.smtp.ok) {
     return { status: 400, payload: { error: 'SMTP did not authenticate, so nothing was saved.', detail: test.payload } };
   }
 
-  const email = engine.normalizeEmail(body.email);
   const user = body.user || email;
   const smtpConfig = test.payload.smtp.config;
   const imapConfig = test.payload.imap && test.payload.imap.ok ? test.payload.imap.config : null;
@@ -137,20 +191,21 @@ async function saveAction(body) {
     createdAt: Date.now()
   };
 
-  await store.set('connection', connection);
-  return { status: 200, payload: { ok: true, connection: engine.publicConnection(connection) } };
+  await engine.setConnection(connection, ws, accountId);
+  return { status: 200, payload: { ok: true, connection: view(accountId, connection), connections: await listView(ws) } };
 }
 
 /** Re-check a stored connection without asking for the password again. */
-async function recheckAction() {
-  const conn = await engine.getConnection();
+async function recheckAction(ws, accountId) {
+  const id = accountId || engine.MAIN_ACCOUNT;
+  const conn = await engine.getConnection(ws, id);
   if (!conn) return { status: 404, payload: { error: 'No mailbox connected' } };
 
   const credentials = engine.smtpCredentials(conn);
   if (!credentials.pass) {
     conn.health = { state: 'invalid_credentials', checkedAt: Date.now(), message: 'Stored credentials could not be decrypted. Reconnect the mailbox.' };
-    await store.set('connection', conn);
-    return { status: 200, payload: { connection: engine.publicConnection(conn) } };
+    await engine.setConnection(conn, ws, id);
+    return { status: 200, payload: { connection: view(id, conn) } };
   }
 
   const result = await providers.verifySmtp(credentials);
@@ -162,37 +217,49 @@ async function recheckAction() {
   }
   conn.health = { state, checkedAt: Date.now(), message: result.message };
   if (result.ok) conn.verifiedAt = Date.now();
-  await store.set('connection', conn);
-  return { status: 200, payload: { connection: engine.publicConnection(conn) } };
+  await engine.setConnection(conn, ws, id);
+  return { status: 200, payload: { connection: view(id, conn) } };
 }
 
-module.exports = http.protect(async (req, res) => {
+module.exports = http.protect(async (req, res, session) => {
   const body = await http.readJson(req, 64 * 1024);
   const action = body.action;
+  // Everyone works with their own mailbox only.
+  const ws = (session && session.ws) || 'default';
 
   let result;
   switch (action) {
     case 'discover': result = await discoverAction(body); break;
     case 'test':     result = await testAction(body); break;
-    case 'save':     result = await saveAction(body); break;
-    case 'recheck':  result = await recheckAction(); break;
-    case 'get':
-      result = { status: 200, payload: { connection: engine.publicConnection(await engine.getConnection()) } };
+    case 'save':     result = await saveAction(body, ws); break;
+    case 'recheck':  result = await recheckAction(ws, body.accountId); break;
+    case 'list':
+      result = { status: 200, payload: { connections: await listView(ws), max: engine.MAX_MAILBOXES } };
       break;
+    case 'get': {
+      // `connection` stays the first mailbox so older screens keep working;
+      // `connections` is the full list.
+      const all = await listView(ws);
+      result = { status: 200, payload: { connection: all[0] || null, connections: all, max: engine.MAX_MAILBOXES } };
+      break;
+    }
     // The display name recipients see. Changing it is not a credential change,
     // so it must not require re-entering the password or re-testing the server.
     case 'set-name': {
-      const conn = await engine.getConnection();
+      const id = body.accountId || engine.MAIN_ACCOUNT;
+      const conn = await engine.getConnection(ws, id);
       if (!conn) { result = { status: 404, payload: { error: 'No mailbox connected' } }; break; }
       conn.fromName = String(body.fromName || '').trim().slice(0, 120) || null;
-      await store.set('connection', conn);
-      result = { status: 200, payload: { connection: engine.publicConnection(conn) } };
+      await engine.setConnection(conn, ws, id);
+      result = { status: 200, payload: { connection: view(id, conn) } };
       break;
     }
-    case 'disconnect':
-      await store.del('connection');
-      result = { status: 200, payload: { ok: true } };
+    case 'disconnect': {
+      const id = body.accountId || engine.MAIN_ACCOUNT;
+      await engine.clearConnection(ws, id);
+      result = { status: 200, payload: { ok: true, connections: await listView(ws) } };
       break;
+    }
     case 'providers':
       result = { status: 200, payload: { presets: providers.PRESETS.map((p) => ({ id: p.id, label: p.label, smtp: p.smtp, imap: p.imap, note: p.note || null })) } };
       break;

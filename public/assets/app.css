@@ -574,3 +574,53 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 @media (max-width: 900px) { .nav-toggle { display: inline-flex; } }
 
 [hidden] { display: none !important; }
+
+/* ------------------------------------------------------------------ mailbox lanes
+   Campaigns are grouped by the mailbox they send from. Each mailbox has an accent
+   colour that follows it everywhere (cards, section headers, row chips) so one
+   mailbox's campaigns are never mistaken for another's. */
+.lane-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
+.lane {
+  position: relative; overflow: hidden;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
+  padding: 20px 20px 18px 24px;
+}
+.lane::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--lane, var(--faint)); }
+.lane--busy { border-color: color-mix(in srgb, var(--lane, #888) 38%, transparent); }
+.lane__email { font-size: 17px; letter-spacing: -0.02em; word-break: break-all; }
+.lane__nums { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 16px; }
+.lane__num { padding: 9px 10px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line); }
+.lane__num b { display: block; font-size: 20px; font-weight: 300; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+.lane__num span { font-size: 10.5px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; }
+.lane__now { margin-top: 14px; padding: 12px 13px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line); }
+.mbx-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--lane, var(--faint)); flex: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--lane, #888) 22%, transparent); }
+.mbx-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  padding: 2px 8px 2px 7px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-3);
+  font-family: var(--mono); font-size: 11px; color: var(--text-2);
+}
+.mbx-chip .mbx-dot { width: 6px; height: 6px; box-shadow: none; }
+.mbx-chip--bad { border-color: rgba(239, 148, 148, 0.3); color: var(--err); }
+.callout { padding: 14px 16px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2); }
+.callout--warn { border-color: rgba(230, 201, 141, 0.24); background: var(--warn-dim); }
+.callout--err { border-color: rgba(239, 148, 148, 0.26); background: var(--err-dim); }
+.rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.rule { display: flex; gap: 11px; align-items: flex-start; }
+.rule .n {
+  flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 11px; background: var(--surface-3); border: 1px solid var(--line-strong, var(--line)); color: var(--text-2);
+}
+.lane-section { margin-top: 34px; }
+.lane-section__head {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  padding: 0 2px 12px; margin-bottom: 0;
+}
+.lane-section .table-wrap { border-left: 3px solid var(--lane, var(--faint)); }
+.filter-chip {
+  display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px 6px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--text-2); font-size: 12.5px; cursor: pointer;
+  transition: border-color 150ms, background 150ms;
+}
+.filter-chip:hover { border-color: var(--line-strong, var(--line)); }
+.filter-chip.is-active { background: var(--surface-3); border-color: var(--lane, var(--text-2)); color: var(--text); }
+.filter-chip .count { color: var(--dim); font-variant-numeric: tabular-nums; }

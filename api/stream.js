@@ -18,7 +18,8 @@ const FRAME_INTERVAL_MS = 1500;
 const STREAM_BUDGET_MS = 50000;
 
 module.exports = async (req, res) => {
-  if (!http.sessionFrom(req)) {
+  const session = http.sessionFrom(req);
+  if (!session) {
     return http.json(res, 401, { error: 'Session expired or missing', code: 'unauthenticated' });
   }
 
@@ -57,7 +58,8 @@ module.exports = async (req, res) => {
       break;
     }
 
-    if (!meta) {
+    // Someone else's campaign is reported exactly like one that does not exist.
+    if (!meta || engine.wsOf(meta) !== (session.ws || 'default')) {
       send('error', { message: 'Campaign not found' });
       break;
     }
