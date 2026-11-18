@@ -52,26 +52,46 @@ async function chain(campaignId, delayHintMs) {
   const url = baseUrl();
   if (!url) return { chained: false, reason: 'No public base URL available' };
 
-  const inFlight = fetch(url + SELF_CALL_PATH, {
+  const send = () => fetch(url + SELF_CALL_PATH, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-worker-token': workerToken(campaignId) },
     body: JSON.stringify({ id: campaignId, hint: delayHintMs || 0 }),
     keepalive: true
-  }).catch((err) => {
+  }).then(() => 'responded').catch((err) => {
     console.error('[worker] chain dispatch failed for ' + campaignId + ':', err.message);
-    return null;
+    return 'failed';
   });
 
-  // Give the request time to leave, but never wait for the tick to finish.
-  const dispatched = await Promise.race([
-    inFlight.then(() => 'responded'),
-    new Promise((resolve) => setTimeout(() => resolve('dispatched'), 500))
-  ]);
+  // Give the request time to actually leave this function (opening a connection
+  // can take well over half a second), but never wait for the tick to finish.
+  const first = send();
+  let dispatched = await Promise.race([first, new Promise((resolve) => setTimeout(() => resolve('dispatched'), 2500))]);
+  if (dispatched === 'failed') {
+    // A hand-off that never left is the one way a campaign goes quiet: try once more.
+    await sleep(400);
+    dispatched = await Promise.race([send(), new Promise((resolve) => setTimeout(() => resolve('dispatched'), 2500))]);
+  }
 
-  return { chained: true, how: dispatched };
+  return { chained: dispatched !== 'failed', how: dispatched };
 }
 
+const SENT_TIMEOUT = 'Saving to the Sent folder timed out';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * Wait for a promise, but never longer than `ms`. Returns `fallback` (or the text
+ * given) on timeout or failure, so a slow or broken side task can never block the
+ * sender. The task is left to finish or fail on its own.
+ */
+function within(ms, promise, fallback) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback === undefined ? null : fallback), ms);
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      () => { clearTimeout(timer); resolve(fallback === undefined ? null : fallback); }
+    );
+  });
+}
 
 /** Locate the next row that is eligible to be attempted right now. */
 async function findNextEligible(meta, now) {
@@ -172,6 +192,8 @@ async function runTick(campaignId) {
     return { ok: false, error: 'No connection configured' };
   }
 
+  await engine.touchWorker(campaignId);
+
   const credentials = engine.smtpCredentials(conn);
   if (!credentials.pass) {
     meta.status = 'blocked';
@@ -196,6 +218,8 @@ async function runTick(campaignId) {
   let sentThisTick = 0;
   let stopReason = 'budget';
   let warnedAboutSent = false;
+  let sentFolderGaveUp = false;
+  let failure = null;
 
   try {
     while (Date.now() < deadline) {
@@ -215,10 +239,19 @@ async function runTick(campaignId) {
       }
 
       // Honour the pacing gap.
+      //
+      // The old version gave up the moment the gap was longer than this cycle's
+      // remaining time and handed off at once - to a new cycle that found the same
+      // thing and did the same. A 70 second gap became dozens of back-to-back
+      // hand-offs in a few seconds, and losing any single one ended the chain.
+      // Instead, sit out as much of the gap as this cycle has room for, and hand
+      // off once, when the time is genuinely used up.
       if (meta.nextSendAt && meta.nextSendAt > now) {
-        const waitMs = meta.nextSendAt - now;
-        if (now + waitMs > deadline - 2000) { stopReason = 'waiting'; break; }
-        await sleep(waitMs);
+        const room = deadline - 2000 - now;
+        if (room <= 0) { stopReason = 'waiting'; break; }
+        await sleep(Math.min(meta.nextSendAt - now, room));
+        // Say we are alive, so a sweep never mistakes a long wait for a stall.
+        await engine.touchWorker(campaignId);
         continue;
       }
 
@@ -292,8 +325,11 @@ async function runTick(campaignId) {
 
         // File a copy in the mailbox's Sent folder. The message is already
         // delivered, so this can never turn a success into a failure.
-        if (sentSaver && sentSaver.enabled && rawMessage && meta.saveToSent !== false) {
-          const problem = await sentSaver.save(rawMessage);
+        if (sentSaver && sentSaver.enabled && rawMessage && meta.saveToSent !== false && !sentFolderGaveUp) {
+          const problem = await within(8000, sentSaver.save(rawMessage), SENT_TIMEOUT);
+          // A mail server that is too slow once will be too slow for the rest of
+          // this cycle: stop asking, rather than adding the wait to every send.
+          if (problem === SENT_TIMEOUT) sentFolderGaveUp = true;
           if (problem && !warnedAboutSent) {
             warnedAboutSent = true;
             engine.pushEvent(meta, 'warning', 'Sent mail is not being copied to your Sent folder', problem);
@@ -368,11 +404,23 @@ async function runTick(campaignId) {
       if (meta.status === 'running') meta.nextSendAt = nowAfter + engine.nextDelay(meta.pacing);
       await engine.setMeta(meta);
     }
+  } catch (err) {
+    failure = err;
   } finally {
-    try { transport.close(); } catch (_) {}
-    try { await sentSaver.close(); } catch (_) {}
     await store.releaseLock(campaignId, lockToken);
   }
+
+  // Tidy up the mail connections, but only AFTER the hand-off below and with a hard
+  // time limit. Closing an IMAP session can be slow; if it ran first and pushed this
+  // function past the platform's 60 second limit, the hand-off would never happen and
+  // the campaign would sit idle until something noticed - which is what made sends
+  // arrive minutes apart instead of seconds.
+  const tidy = () => within(6000, Promise.all([
+    Promise.resolve().then(() => transport.close()).catch(() => {}),
+    Promise.resolve().then(() => sentSaver.close()).catch(() => {})
+  ]), null);
+
+  if (failure) { await tidy(); throw failure; }
 
   // Hand off to a fresh invocation if there is still work to do.
   const finalMeta = await engine.getMeta(campaignId);
@@ -380,6 +428,7 @@ async function runTick(campaignId) {
   if (finalMeta && finalMeta.status === 'running') {
     chained = await chain(campaignId);
   }
+  await tidy();
 
   return {
     ok: true,
@@ -403,7 +452,7 @@ async function sweep(onlyWs) {
     if (!meta || meta.status !== 'running') continue;
     const last = meta.worker && meta.worker.lastTickAt ? meta.worker.lastTickAt : meta.startedAt || 0;
     const due = meta.nextSendAt ? meta.nextSendAt : 0;
-    const stalled = Date.now() - last > 120000 && (!due || due <= Date.now() + 5000);
+    const stalled = Date.now() - last > 75000 && (!due || due <= Date.now() + 5000);
     if (stalled) {
       revived.push(id);
       await chain(id);

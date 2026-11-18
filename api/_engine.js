@@ -64,6 +64,18 @@ async function setMeta(meta) {
   return meta;
 }
 
+/**
+ * Record that this campaign's worker is alive right now. Without it the only sign
+ * of life was a completed send, so a long, perfectly healthy wait between sends
+ * looked exactly like a dead chain.
+ */
+async function touchWorker(id) {
+  const meta = await getMeta(id);
+  if (!meta || meta.status !== 'running') return;
+  meta.worker = { chainId: meta.worker ? meta.worker.chainId : null, lastTickAt: Date.now() };
+  await store.set(metaKey(id), meta);
+}
+
 async function getChunk(id, n) {
   return (await store.get(chunkKey(id, n))) || [];
 }
@@ -871,6 +883,7 @@ module.exports = {
   readRecipients,
   updateRecipient,
   pushEvent,
+  touchWorker,
   getConnection,
   setConnection,
   clearConnection,
