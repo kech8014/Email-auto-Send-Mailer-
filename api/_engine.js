@@ -71,7 +71,7 @@ async function setMeta(meta) {
  */
 async function touchWorker(id) {
   const meta = await getMeta(id);
-  if (!meta || meta.status !== 'running') return;
+  if (!meta || (meta.status !== 'running' && meta.status !== 'scheduled')) return;
   meta.worker = { chainId: meta.worker ? meta.worker.chainId : null, lastTickAt: Date.now() };
   await store.set(metaKey(id), meta);
 }
@@ -245,7 +245,7 @@ async function mailboxBusy(meta) {
   for (const id of await store.listCampaignIds(ws)) {
     if (id === meta.id) continue;
     const other = await getMeta(id);
-    if (other && other.status === 'running' && pickAccount(other, all).id === account) {
+    if (other && (other.status === 'running' || other.status === 'scheduled') && pickAccount(other, all).id === account) {
       return { id: other.id, name: other.name };
     }
   }
@@ -701,7 +701,8 @@ async function listCampaigns(ws) {
       // Recent sending, so a mailbox's real load is visible at a glance.
       sentLastHour: (meta.sendLog || []).filter((t) => Date.now() - t < 3600000).length,
       sentLast24h: (meta.sendLog || []).filter((t) => Date.now() - t < 86400000).length,
-      nextSendAt: meta.nextSendAt || null
+      nextSendAt: meta.nextSendAt || null,
+      scheduledStartAt: meta.scheduledStartAt || null
     });
   }
   return out;

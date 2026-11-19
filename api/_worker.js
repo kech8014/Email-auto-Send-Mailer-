@@ -176,6 +176,45 @@ async function runTick(campaignId) {
     await store.releaseLock(campaignId, lockToken);
     return { ok: false, error: 'Campaign not found' };
   }
+  // A scheduled campaign holds its mailbox and waits for its start time. Until then
+  // it just stays alive (one slice per cycle, like a long gap between sends); when the
+  // time comes it becomes a running campaign and carries on into the normal loop below.
+  if (meta.status === 'scheduled') {
+    const wait = (meta.scheduledStartAt || 0) - Date.now();
+    if (wait > 0) {
+      await sleep(Math.min(wait, engine.TICK_BUDGET_MS - 4000));
+      await engine.touchWorker(campaignId);
+      meta = await engine.getMeta(campaignId);
+      const stillWaiting = meta && meta.status === 'scheduled' && (meta.scheduledStartAt || 0) > Date.now();
+      if (stillWaiting) {
+        await store.releaseLock(campaignId, lockToken);
+        const handed = await chain(campaignId);
+        return { ok: true, status: 'scheduled', waitingForSchedule: true, chained: handed.chained };
+      }
+      if (!meta || meta.status !== 'scheduled') {
+        await store.releaseLock(campaignId, lockToken);
+        return { ok: true, status: meta ? meta.status : 'missing', idle: true };
+      }
+    }
+    // The time has come. Never start on top of another campaign using this mailbox.
+    const busy = await engine.mailboxBusy(meta);
+    if (busy) {
+      meta.status = 'blocked';
+      meta.scheduledStartAt = null;
+      engine.pushEvent(meta, 'error', 'Scheduled start skipped - another campaign is already sending from this mailbox', busy.name);
+      await engine.setMeta(meta);
+      await store.releaseLock(campaignId, lockToken);
+      return { ok: false, error: 'mailbox busy at scheduled time' };
+    }
+    meta.status = 'running';
+    meta.startedAt = meta.startedAt || Date.now();
+    meta.completedAt = null;
+    meta.nextSendAt = Date.now();
+    engine.pushEvent(meta, 'campaign', 'Scheduled start reached', meta.stats.total + ' recipients, ' + meta.stats.sent + ' already sent');
+    meta.scheduledStartAt = null;
+    await engine.setMeta(meta);
+  }
+
   if (meta.status !== 'running') {
     await store.releaseLock(campaignId, lockToken);
     return { ok: true, status: meta.status, idle: true };
@@ -449,7 +488,13 @@ async function sweep(onlyWs) {
   const revived = [];
   for (const id of ids) {
     const meta = await engine.getMeta(id);
-    if (!meta || meta.status !== 'running') continue;
+    if (!meta || (meta.status !== 'running' && meta.status !== 'scheduled')) continue;
+    if (meta.status === 'scheduled') {
+      const lastSeen = meta.worker && meta.worker.lastTickAt ? meta.worker.lastTickAt : 0;
+      const timeHasCome = (meta.scheduledStartAt || 0) <= Date.now() + 5000;
+      if (timeHasCome || Date.now() - lastSeen > 75000) { revived.push(id); await chain(id); }
+      continue;
+    }
     const last = meta.worker && meta.worker.lastTickAt ? meta.worker.lastTickAt : meta.startedAt || 0;
     const due = meta.nextSendAt ? meta.nextSendAt : 0;
     const stalled = Date.now() - last > 75000 && (!due || due <= Date.now() + 5000);

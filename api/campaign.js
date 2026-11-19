@@ -96,7 +96,7 @@ async function controlAction(body, session) {
   // The mailbox this campaign was created for - and only that one.
   const resolved = await engine.resolveAccount(meta);
   const conn = resolved.conn;
-  const wrongMailbox = !conn && (body.command === 'start' || body.command === 'resume' || body.command === 'retry-failed')
+  const wrongMailbox = !conn && (body.command === 'start' || body.command === 'resume' || body.command === 'retry-failed' || body.command === 'schedule')
     ? { status: 400, payload: { error: engine.accountProblem(resolved), mailbox: resolved } }
     : null;
   if (wrongMailbox) return wrongMailbox;
@@ -110,6 +110,7 @@ async function controlAction(body, session) {
       if (!check.canStart) {
         return { status: 400, payload: { error: 'Preflight failed', preflight: check } };
       }
+      meta.scheduledStartAt = null;
       meta.status = 'running';
       meta.startedAt = meta.startedAt || Date.now();
       meta.completedAt = null;
@@ -121,8 +122,39 @@ async function controlAction(body, session) {
       return { status: 200, payload: { campaign: publicMeta(meta), worker: kicked } };
     }
 
+    // Start at a chosen time. The campaign holds its mailbox from now on (nothing else
+    // can start on it), waits, and becomes a running campaign at that moment.
+    case 'schedule': {
+      const startAt = Number(body.startAt);
+      const now = Date.now();
+      if (!Number.isFinite(startAt) || startAt < now + 3000) {
+        return { status: 400, payload: { error: 'Choose a start time in the future.' } };
+      }
+      if (startAt > now + 30 * 86400000) {
+        return { status: 400, payload: { error: 'A start time can be at most 30 days ahead.' } };
+      }
+      if (!['ready', 'paused', 'stopped', 'blocked', 'scheduled'].includes(meta.status)) {
+        return { status: 400, payload: { error: 'A ' + meta.status + ' campaign cannot be scheduled.' } };
+      }
+      const check = await engine.preflight(meta, conn);
+      if (!check.canStart) return { status: 400, payload: { error: 'Preflight failed', preflight: check } };
+      const conflict = await busyError(meta);
+      if (conflict) return conflict;
+
+      const was = meta.status;
+      meta.status = 'scheduled';
+      meta.scheduledStartAt = startAt;
+      meta.nextSendAt = null;
+      meta.completedAt = null;
+      engine.pushEvent(meta, 'campaign', 'Scheduled to start', new Date(startAt).toISOString() + ' (was ' + was + '; ' + meta.stats.sent + ' already sent)');
+      await engine.setMeta(meta);
+      const kicked = await worker.chain(meta.id);
+      return { status: 200, payload: { campaign: publicMeta(meta), worker: kicked, startAt } };
+    }
+
     case 'pause': {
-      if (meta.status !== 'running') return { status: 400, payload: { error: 'Campaign is not running' } };
+      if (meta.status !== 'running' && meta.status !== 'scheduled') return { status: 400, payload: { error: 'Campaign is not running' } };
+      meta.scheduledStartAt = null;
       meta.status = 'paused';
       engine.pushEvent(meta, 'campaign', 'Campaign paused');
       await engine.setMeta(meta);
@@ -155,6 +187,7 @@ async function controlAction(body, session) {
     }
 
     case 'stop': {
+      meta.scheduledStartAt = null;
       meta.status = 'stopped';
       meta.completedAt = Date.now();
       meta.nextSendAt = null;

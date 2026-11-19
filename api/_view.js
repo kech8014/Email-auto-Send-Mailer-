@@ -23,6 +23,7 @@ function publicMeta(meta) {
     sender: meta.sender,
     cursor: meta.cursor,
     nextSendAt: meta.nextSendAt,
+    scheduledStartAt: meta.scheduledStartAt || null,
     stats: meta.stats,
     import: meta.import,
     events: meta.events || [],

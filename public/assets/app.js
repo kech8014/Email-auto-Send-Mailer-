@@ -520,6 +520,7 @@
       running: ['pill--ok pill--live', 'Running'],
       completed: ['pill--ok', 'Completed'],
       paused: ['pill--warn', 'Paused'],
+      scheduled: ['pill--warn pill--live', 'Scheduled'],
       blocked: ['pill--err', 'Blocked'],
       stopped: ['', 'Stopped'],
       ready: ['', 'Ready'],
@@ -720,7 +721,10 @@
                 el('div', { class: 'hint truncate', style: { maxWidth: '260px' }, text: c.subject || '(no subject)' }),
                 c.mailbox ? el('div', { style: { marginTop: '5px' } }, [mailboxChip(c.mailbox)]) : null
               ]),
-              el('td', {}, [statePill(c.status)]),
+              el('td', {}, [
+                statePill(c.status),
+                c.status === 'scheduled' && c.scheduledStartAt ? el('div', { class: 'hint', style: { marginTop: '5px', whiteSpace: 'nowrap' }, text: 'starts ' + fmtET(c.scheduledStartAt) }) : null
+              ]),
               el('td', { class: 'num', text: fmtNum(c.stats.total) }),
               el('td', { class: 'num', text: fmtNum(c.stats.sent) }),
               el('td', { class: 'num', text: c.stats.failed ? fmtNum(c.stats.failed) : '—' }),
@@ -733,7 +737,13 @@
               el('td', { class: 'hint', text: fmtDate(c.createdAt) }),
               el('td', {}, [el('div', { class: 'row', style: { gap: '6px', justifyContent: 'flex-end' } }, [
                 el('button', { class: 'btn btn--sm', text: 'Open', onclick: () => openCampaign(c.id) }),
-                state.connections.length > 1 && c.status !== 'running'
+                ['ready', 'paused', 'stopped'].includes(c.status)
+                  ? el('button', { class: 'btn btn--sm', text: 'Schedule', title: 'Start this campaign at a time you choose (New York time)', onclick: () => scheduleCampaign(c) })
+                  : null,
+                c.status === 'scheduled'
+                  ? el('button', { class: 'btn btn--sm', text: 'Cancel', title: 'Cancel the scheduled start', onclick: async () => { try { await api('campaign', { action: 'control', id: c.id, command: 'stop' }); toast('Schedule cancelled', 'ok'); render(); } catch (err) { toast(err.message, 'err'); } } })
+                  : null,
+                state.connections.length > 1 && c.status !== 'running' && c.status !== 'scheduled'
                   ? el('button', { class: 'btn btn--sm', text: 'Move', title: 'Send the rest of this campaign from a different mailbox', onclick: () => moveCampaign(c) })
                   : null,
                 el('button', { class: 'btn btn--sm btn--danger', text: 'Delete', title: 'Delete this campaign and its history', onclick: () => deleteCampaign(c) })
@@ -743,6 +753,89 @@
         ])
       ])
     ]);
+  }
+
+  // ---- scheduled start (all times are New York time) ----------------------------
+
+  const ET = 'America/New_York';
+
+  /** The wall-clock parts of an instant, in New York. */
+  function etParts(ms) {
+    const f = new Intl.DateTimeFormat('en-US', { timeZone: ET, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    const o = {};
+    for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;
+    return { y: +o.year, mo: +o.month, d: +o.day, h: +o.hour, mi: +o.minute };
+  }
+
+  /** The instant at which New York's clock reads this date and time (handles daylight saving). */
+  function etToEpoch(y, mo, d, h, mi) {
+    const want = Date.UTC(y, mo - 1, d, h, mi);
+    let t = want;
+    for (let i = 0; i < 3; i += 1) {
+      const p = etParts(t);
+      t += want - Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi);
+    }
+    return t;
+  }
+
+  function fmtET(ms) {
+    if (!ms) return '';
+    return new Intl.DateTimeFormat('en-US', { timeZone: ET, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(ms)) + ' ET';
+  }
+
+  /** The next 7:15 AM in New York: today if it has not passed yet, otherwise tomorrow. */
+  function nextSevenFifteen() {
+    const now = Date.now();
+    const p = etParts(now);
+    let t = etToEpoch(p.y, p.mo, p.d, 7, 15);
+    if (t <= now + 60000) t = etToEpoch(p.y, p.mo, p.d + 1, 7, 15);
+    return etParts(t);
+  }
+
+  function scheduleCampaign(c) {
+    const def = nextSevenFifteen();
+    const pad = (n) => String(n).padStart(2, '0');
+    const date = el('input', { class: 'input', type: 'date', value: def.y + '-' + pad(def.mo) + '-' + pad(def.d) });
+    const time = el('input', { class: 'input', type: 'time', value: pad(def.h) + ':' + pad(def.mi) });
+    const preview = el('p', { class: 'hint', style: { marginTop: '10px' } });
+    const compute = () => {
+      const [y, mo, d] = (date.value || '').split('-').map(Number);
+      const [h, mi] = (time.value || '').split(':').map(Number);
+      if (!y || !mo || !d || Number.isNaN(h) || Number.isNaN(mi)) return null;
+      return etToEpoch(y, mo, d, h, mi);
+    };
+    const paint = () => {
+      const at = compute();
+      preview.textContent = at ? 'Starts ' + fmtET(at) + (at < Date.now() + 5000 ? '  \u2014 that time has already passed' : '') : 'Choose a date and time';
+    };
+    date.addEventListener('input', paint); time.addEventListener('input', paint); paint();
+
+    const left = c.stats.total - c.stats.sent - c.stats.failed - c.stats.skipped;
+    const confirmBtn = el('button', { class: 'btn btn--primary', text: 'Schedule start' });
+    const close = modal('Schedule \u201c' + c.name + '\u201d', el('div', {}, [
+      el('p', { class: 'hint', style: { marginBottom: '12px' }, text: fmtNum(left) + ' recipient(s) are still waiting. ' + fmtNum(c.stats.sent) + ' already sent will not be mailed again.' }),
+      el('div', { class: 'grid grid--2' }, [
+        el('div', { class: 'field' }, [el('label', { class: 'label', text: 'Date (New York)' }), date]),
+        el('div', { class: 'field' }, [el('label', { class: 'label', text: 'Time (New York)' }), time])
+      ]),
+      preview,
+      el('ul', { class: 'hint', style: { margin: '14px 0 0', paddingLeft: '18px', lineHeight: '1.7' } }, [
+        el('li', { text: 'Nothing is sent until that time. The campaign holds its mailbox, so no other campaign can start on it first.' }),
+        el('li', { text: 'You can cancel the schedule, or start it right away, from the Campaigns page.' })
+      ])
+    ]), [el('button', { class: 'btn', text: 'Cancel', onclick: () => close() }), confirmBtn]);
+
+    confirmBtn.onclick = async () => {
+      const at = compute();
+      if (!at) return toast('Choose a date and time', 'warn');
+      confirmBtn.disabled = true;
+      try {
+        await api('campaign', { action: 'control', id: c.id, command: 'schedule', startAt: at });
+        close();
+        toast('Scheduled for ' + fmtET(at), 'ok', 6000);
+        render();
+      } catch (err) { toast(err.message, 'err'); confirmBtn.disabled = false; }
+    };
   }
 
   /**
@@ -2104,6 +2197,9 @@
           const left = c.stats.total - c.stats.sent - c.stats.failed - c.stats.skipped;
           if (await confirmDialog('Resume campaign', 'Sending continues with the ' + fmtNum(left) + ' recipients not yet sent. The ' + fmtNum(c.stats.sent) + ' already sent will not be mailed again.', 'Resume now')) control('resume');
         } }) : null,
+        c.status === 'scheduled' ? el('span', { class: 'hint', style: { alignSelf: 'center' }, text: 'Starts ' + fmtET(c.scheduledStartAt) }) : null,
+        c.status === 'scheduled' ? el('button', { class: 'btn', text: 'Start now', onclick: () => control('start') }) : null,
+        c.status === 'scheduled' ? el('button', { class: 'btn btn--danger', text: 'Cancel schedule', onclick: () => control('stop') }) : null,
         (running || c.status === 'paused') ? el('button', { class: 'btn btn--danger', text: 'Stop', onclick: async () => {
           if (await confirmDialog('Stop campaign', 'Sending stops immediately. ' + fmtNum(c.stats.sent) + ' messages have already gone out and cannot be recalled.', 'Stop now')) control('stop');
         } }) : null,
@@ -2426,6 +2522,7 @@
     const hour = g.campaigns.reduce((n, c) => n + (c.sentLastHour || 0), 0);
     const day = g.campaigns.reduce((n, c) => n + (c.sentLast24h || 0), 0);
     const live = running[0];
+    const held = g.campaigns.find((c) => c.status === 'scheduled');
     const [cls, label] = g.connected ? mailboxHealth(g.conn) : ['pill--err', 'Not connected'];
     const caps = live && live.pacing ? live.pacing : null;
 
@@ -2449,6 +2546,15 @@
           el('span', { class: 'hint', text: caps ? 'cap ' + caps.hourlyCap + '/hr · ' + caps.dailyCap + '/day' : '' })
         ]),
         running.length > 1 ? el('p', { class: 'hint', style: { color: 'var(--err)', marginTop: '8px' }, text: running.length + ' campaigns are running on this mailbox - stop all but one.' }) : null
+      ]);
+    } else if (held) {
+      now = el('div', { class: 'lane__now' }, [
+        el('div', { class: 'between' }, [
+          el('span', { class: 'pill pill--warn pill--live' }, [el('span', { class: 'dot' }), el('span', { text: 'Scheduled' })]),
+          el('button', { class: 'btn btn--sm', text: 'Open', onclick: () => openCampaign(held.id) })
+        ]),
+        el('div', { style: { marginTop: '10px', fontSize: '13.5px' }, class: 'truncate', text: held.name }),
+        el('div', { class: 'hint', style: { marginTop: '6px' }, text: 'Starts ' + fmtET(held.scheduledStartAt) + ' · ' + fmtNum(held.stats.total - held.stats.sent - held.stats.failed - held.stats.skipped) + ' to send. Nothing else can start on this mailbox before then.' })
       ]);
     } else {
       now = el('div', { class: 'lane__now' }, [
@@ -2608,7 +2714,7 @@
                 el('div', { style: { minWidth: 0 } }, [
                   el('div', { class: 'h-md truncate', text: g.email }),
                   el('div', { class: 'hint', text: g.connected
-                    ? 'These campaigns send only from this mailbox · ' + fmtNum(g.campaigns.length) + ' total' + (running ? ' · 1 sending now' : ' · none sending')
+                    ? 'These campaigns send only from this mailbox · ' + fmtNum(g.campaigns.length) + ' total' + (running ? ' · 1 sending now' : (g.campaigns.some((c) => c.status === 'scheduled') ? ' · 1 scheduled' : ' · none sending'))
                     : 'Their mailbox is not connected, so none of them can send.' })
                 ])
               ]),
@@ -2920,10 +3026,11 @@
   let heartbeat = null;
   function startHeartbeat() {
     clearInterval(heartbeat);
+    // Every 30 seconds, and also from a background tab: a Kech page left open is the
+    // watchdog that restarts a stalled campaign, so it must not go quiet when unfocused.
     heartbeat = setInterval(() => {
-      if (document.hidden) return;
       fetch('/api/tick?sweep=1', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{"sweep":true}' }).catch(() => {});
-    }, 120000);
+    }, 30000);
   }
 
   // ==========================================================================

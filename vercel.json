@@ -8,7 +8,8 @@
     "api/upload.js": { "maxDuration": 30, "memory": 1024 }
   },
   "crons": [
-    { "path": "/api/tick?sweep=1", "schedule": "0 3 * * *" }
+    { "path": "/api/tick?sweep=1", "schedule": "0 3 * * *" },
+    { "path": "/api/tick?sweep=1", "schedule": "0 12 * * *" }
   ],
   "headers": [
     {
